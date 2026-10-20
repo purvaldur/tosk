@@ -1,0 +1,17 @@
+[package]
+name = "tosk"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+crossterm = "0.29.0"
+dirs = "7.0.0"
+image = "0.25"
+jiff = "0.2.38"
+ratatui = "0.30.2"
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm", "image-defaults"] }
+syntect = "5.3.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -1,0 +1,119 @@
+mod app;
+mod clipboard;
+mod command;
+mod counts;
+mod entry;
+mod format;
+mod fs;
+mod icons;
+mod input;
+mod keymap;
+mod launch;
+mod preview;
+mod shortcuts;
+mod sort;
+mod theme;
+mod ui;
+
+use std::io::{self, Stdout};
+use std::time::Duration;
+
+use anyhow::Result;
+use crossterm::event::{
+    self, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use crossterm::{cursor, execute};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
+use ratatui_image::picker::{Picker, ProtocolType};
+
+use crate::app::App;
+
+const TICK: Duration = Duration::from_millis(50);
+
+fn main() -> Result<()> {
+    let dir = std::env::current_dir()?;
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore();
+        hook(info);
+    }));
+
+    let result = init().and_then(|mut terminal| {
+        let pins = dirs::config_dir().map(|d| d.join("tosk/shortcuts"));
+        let mut app = App::new(dir, kitty_graphics(), pins)?;
+        run(&mut terminal, &mut app)
+    });
+    restore();
+    result
+}
+
+fn init() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+    enable_raw_mode()?;
+    // kitty keeps a separate keyboard mode stack per screen, so push after
+    // entering the alternate screen and pop before leaving it.
+    execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        )
+    )?;
+    Ok(Terminal::new(CrosstermBackend::new(io::stdout()))?)
+}
+
+/// Asks the terminal about graphics support and font size. Images only
+/// render with the kitty protocol; anything else gets the info card.
+fn kitty_graphics() -> Option<Picker> {
+    // Only ask kitty: a terminal that never answers leaves the query's
+    // reader thread consuming keystrokes.
+    std::env::var_os("KITTY_WINDOW_ID")?;
+    Picker::from_query_stdio()
+        .ok()
+        .filter(|p| p.protocol_type() == ProtocolType::Kitty)
+}
+
+fn restore() {
+    let _ = execute!(
+        io::stdout(),
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen,
+        cursor::Show
+    );
+    let _ = disable_raw_mode();
+}
+
+fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+    let mut dirty = true;
+    while !app.quit {
+        dirty |= app.drain_workers();
+        if dirty {
+            let size = terminal.size()?;
+            let areas = ui::Areas::new(Rect::new(0, 0, size.width, size.height), app.preview);
+            app.sync_preview(areas.preview_size());
+            terminal.draw(|frame| ui::draw(frame, app))?;
+            dirty = false;
+        }
+        if event::poll(TICK)? {
+            // Handle everything that's queued before redrawing once.
+            loop {
+                match event::read()? {
+                    Event::Key(key) => input::handle_key(app, key),
+                    Event::Resize(..) => {}
+                    _ => continue,
+                }
+                dirty = true;
+                if app.quit || !event::poll(Duration::ZERO)? {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
