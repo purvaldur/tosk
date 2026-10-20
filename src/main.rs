@@ -9,9 +9,12 @@ mod icons;
 mod input;
 mod keymap;
 mod launch;
+mod modal;
 mod preview;
+mod rename;
 mod shortcuts;
 mod sort;
+mod text_input;
 mod theme;
 mod ui;
 

@@ -2,7 +2,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 
-use super::{put, width};
+use super::{input_line, put, width};
 use crate::app::{App, Focus};
 use crate::format::count;
 use crate::theme::*;
@@ -27,18 +27,36 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect) {
         Style::default().fg(OVERLAY0),
     );
 
-    let chip = Style::default()
-        .bg(ACCENT)
-        .fg(ON_ACCENT)
-        .add_modifier(Modifier::BOLD);
+    let chip = |bg| {
+        Style::default()
+            .bg(bg)
+            .fg(ON_ACCENT)
+            .add_modifier(Modifier::BOLD)
+    };
+    let room = right_x.saturating_sub(area.x + 2);
+
+    // While a filter is set, it replaces the path: chip, then the query.
+    if app.filtering || !app.filter.text.is_empty() {
+        let used = put(buf, area.x, area.y, " FILTER ", room, chip(MAUVE));
+        let x = area.x + used + 1;
+        let w = room.saturating_sub(used + 1);
+        let style = Style::default().fg(TEXT);
+        if app.filtering {
+            input_line(buf, x, area.y, w, &app.filter, style);
+        } else {
+            put(buf, x, area.y, &app.filter.text, w, style);
+        }
+        return;
+    }
+
     let mode = match app.focus {
         Focus::Files => " FILES ",
         Focus::Sidebar => " SHORTCUTS ",
     };
     let mut x = area.x;
-    let mut room = right_x.saturating_sub(area.x + 2);
+    let mut room = room;
     for (text, style) in [
-        (mode.to_string(), chip),
+        (mode.to_string(), chip(ACCENT)),
         (app.display_path(&app.dir), Style::default().fg(TEXT)),
         (
             app.current().map(|e| e.name.clone()).unwrap_or_default(),

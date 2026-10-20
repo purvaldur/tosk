@@ -18,11 +18,16 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect) {
     }
     if app.visible.is_empty() {
         let style = Style::default().fg(OVERLAY0);
+        let text = if app.filter.text.is_empty() {
+            "empty folder".to_string()
+        } else {
+            format!("no match for “{}”", app.filter.text)
+        };
         put(
             buf,
             body.x + 2,
             body.y,
-            "empty folder",
+            &text,
             body.width.saturating_sub(2),
             style,
         );

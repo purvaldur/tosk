@@ -25,6 +25,26 @@ impl Vfs for Local {
     fn resolve(&self, path: &Path) -> io::Result<PathBuf> {
         fs::canonicalize(path)
     }
+
+    fn exists(&self, path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok()
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        fs::rename(from, to)
+    }
+
+    fn trash(&self, paths: &[PathBuf]) -> io::Result<()> {
+        trash::delete_all(paths).map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    fn delete(&self, path: &Path) -> io::Result<()> {
+        if fs::symlink_metadata(path)?.is_dir() {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        }
+    }
 }
 
 fn entry_for(path: &Path, file_name: OsString) -> Entry {
@@ -100,6 +120,26 @@ mod tests {
         let broken = find(&v, "broken");
         assert_eq!(broken.kind, Kind::Missing);
         assert_eq!(broken.link_target.as_deref(), Some(Path::new("nowhere")));
+    }
+
+    #[test]
+    fn delete_removes_links_not_their_targets() {
+        let tmp = TempDir::new().unwrap();
+        let r = tmp.path();
+        fs::create_dir_all(r.join("keep/inner")).unwrap();
+        fs::write(r.join("keep/inner/f"), "x").unwrap();
+        symlink("keep", r.join("link")).unwrap();
+        fs::create_dir_all(r.join("tree/sub")).unwrap();
+        fs::write(r.join("tree/sub/f"), "x").unwrap();
+        fs::write(r.join("file"), "x").unwrap();
+
+        Local.delete(&r.join("link")).unwrap();
+        assert!(!Local.exists(&r.join("link")));
+        assert!(r.join("keep/inner/f").exists());
+        Local.delete(&r.join("tree")).unwrap();
+        Local.delete(&r.join("file")).unwrap();
+        assert!(!Local.exists(&r.join("tree")) && !Local.exists(&r.join("file")));
+        assert!(Local.delete(&r.join("gone")).is_err());
     }
 
     #[test]

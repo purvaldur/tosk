@@ -73,6 +73,10 @@ impl Command {
 
 pub fn dispatch(app: &mut App, cmd: Command) {
     use Command::*;
+    // In the sidebar, Space and Enter open the shortcut like l does.
+    if app.focus == Focus::Sidebar && matches!(cmd, OpenDefault | SelectToggle) {
+        return app.nav_enter();
+    }
     if app.focus == Focus::Sidebar && cmd.acts_on_files() {
         return app.info(format!(
             "{} works on the file list; Tab over first",
@@ -96,6 +100,13 @@ pub fn dispatch(app: &mut App, cmd: Command) {
         FileCopy => app.copy_files(),
         PathCopy => app.copy_paths(),
         ShortcutPin => app.toggle_pin(),
+        FileTrash => app.start_remove(false),
+        FileDelete => app.start_remove(true),
+        FileRename => app.start_rename(),
+        FilterStart => {
+            app.focus = Focus::Files;
+            app.start_filter();
+        }
         AppQuit => app.quit = true,
         _ => app.info(format!("{} isn't built yet", cmd.title())),
     }

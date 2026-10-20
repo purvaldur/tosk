@@ -16,7 +16,10 @@ use crate::fs::Vfs;
 use crate::fs::local::Local;
 use crate::keymap::Keymap;
 use crate::preview::{self, Previewer};
+use crate::modal::Modal;
+use crate::rename;
 use crate::shortcuts::{Pin, Shortcuts};
+use crate::text_input::TextInput;
 use crate::sort::sort_entries;
 use crate::{clipboard, launch};
 
@@ -29,13 +32,6 @@ pub enum Focus {
 /// What `Tab` and `S-Tab` cycle through. The terminal (milestone 6) stays
 /// out of it on purpose.
 const FOCUS_CYCLE: &[Focus] = &[Focus::Sidebar, Focus::Files];
-
-/// A selected item. The entry is a snapshot, so the selection can span
-/// folders.
-pub struct Selected {
-    pub path: PathBuf,
-    pub entry: Entry,
-}
 
 pub struct Message {
     pub text: String,
@@ -53,8 +49,14 @@ pub struct App {
     pub focus: Focus,
     pub shortcuts: Shortcuts,
     pub side_cursor: usize,
-    /// In the order things were selected; bulk rename numbers in this order.
-    pub selection: Vec<Selected>,
+    /// Names in the current folder, in the order they were selected (bulk
+    /// rename numbers in this order). Only ever holds what's visible: it
+    /// clears when the folder changes and loses what a filter hides.
+    pub selection: Vec<OsString>,
+    pub filter: TextInput,
+    /// The filter is being typed.
+    pub filtering: bool,
+    pub modal: Option<Modal>,
     pub show_hidden: bool,
     pub preview: bool,
     /// What the preview pane should show, set before each draw.
@@ -89,6 +91,9 @@ impl App {
             shortcuts: Shortcuts::load(home.as_deref(), pins),
             side_cursor: 0,
             selection: Vec::new(),
+            filter: TextInput::default(),
+            filtering: false,
+            modal: None,
             show_hidden: false,
             preview: true,
             preview_key: None,
@@ -225,32 +230,37 @@ impl App {
     }
 
     pub fn is_selected(&self, e: &Entry) -> bool {
-        let path = self.dir.join(&e.file_name);
-        self.selection.iter().any(|s| s.path == path)
+        self.selection.contains(&e.file_name)
     }
 
     /// Select or unselect the item under the cursor. The cursor stays put.
     pub fn toggle_select(&mut self) {
-        let Some(e) = self.current() else { return };
-        let path = self.dir.join(&e.file_name);
-        match self.selection.iter().position(|s| s.path == path) {
+        let Some(name) = self.current().map(|e| e.file_name.clone()) else {
+            return;
+        };
+        match self.selection.iter().position(|n| *n == name) {
             Some(i) => {
                 self.selection.remove(i);
             }
-            None => {
-                let entry = e.clone();
-                self.selection.push(Selected { path, entry });
-            }
+            None => self.selection.push(name),
         }
     }
 
-    /// Clears the selection (and, from milestone 4, the filter).
+    /// Clears the selection and the filter.
     pub fn clear_selection(&mut self) {
         self.selection.clear();
+        if !self.filter.text.is_empty() {
+            self.filter.clear();
+            self.refilter_here();
+        }
     }
 
     pub fn selection_summary(&self) -> String {
-        let entries: Vec<&Entry> = self.selection.iter().map(|s| &s.entry).collect();
+        let entries: Vec<&Entry> = self
+            .selection
+            .iter()
+            .filter_map(|n| self.entries.iter().find(|e| e.file_name == *n))
+            .collect();
         selection_summary(&entries)
     }
 
@@ -261,7 +271,149 @@ impl App {
                 .map(|e| vec![self.dir.join(&e.file_name)])
                 .unwrap_or_default()
         } else {
-            self.selection.iter().map(|s| s.path.clone()).collect()
+            self.selection.iter().map(|n| self.dir.join(n)).collect()
+        }
+    }
+
+    pub fn start_filter(&mut self) {
+        self.filtering = true;
+    }
+
+    /// Keeps the filter and goes back to normal keys.
+    pub fn keep_filter(&mut self) {
+        self.filtering = false;
+    }
+
+    pub fn cancel_filter(&mut self) {
+        self.filtering = false;
+        self.filter.clear();
+        self.refilter_here();
+    }
+
+    /// Re-applies hidden files and the filter, keeping the cursor on the
+    /// same item when it's still shown.
+    pub fn refilter_here(&mut self) {
+        let anchor = self.visible.get(self.cursor).copied().unwrap_or(0);
+        let name = self.current().map(|e| e.file_name.clone());
+        self.refilter(name.as_deref(), anchor);
+    }
+
+    /// Ask before trashing (or with `delete`, removing) the targets.
+    pub fn start_remove(&mut self, delete: bool) {
+        let paths = self.targets();
+        if !paths.is_empty() {
+            self.modal = Some(Modal::Confirm { delete, paths });
+        }
+    }
+
+    /// `y` in the confirm dialog.
+    pub fn confirm_remove(&mut self) {
+        let Some(Modal::Confirm { delete, paths }) = self.modal.take() else {
+            return;
+        };
+        let n = paths.len();
+        let result = if delete {
+            paths
+                .iter()
+                .enumerate()
+                .try_for_each(|(i, p)| self.vfs.delete(p).map_err(|e| (i, e)))
+        } else {
+            self.vfs.trash(&paths).map_err(|e| (0, e))
+        };
+        match (result, delete) {
+            (Ok(()), false) => self.info(format!("{n} moved to trash, restorable")),
+            (Ok(()), true) => self.info(format!("{n} deleted for good")),
+            (Err((_, e)), false) => self.error(format!("can't move to trash: {e}")),
+            (Err((i, e)), true) => self.error(format!("deleted {i} of {n}, then: {e}")),
+        }
+        self.selection.clear();
+        self.reload(None);
+    }
+
+    /// A plain rename of the cursor item, or a bulk rename of the selection.
+    pub fn start_rename(&mut self) {
+        let names: Vec<OsString> = if self.selection.is_empty() {
+            self.current().map(|e| e.file_name.clone()).into_iter().collect()
+        } else {
+            self.selection.clone()
+        };
+        let olds: Option<Vec<String>> = names.into_iter().map(|n| n.into_string().ok()).collect();
+        let Some(olds) = olds else {
+            return self.error("can't rename names that aren't valid UTF-8".into());
+        };
+        let input = match olds.as_slice() {
+            [] => return,
+            [one] => TextInput::new(one),
+            _ => TextInput::default(),
+        };
+        self.modal = Some(Modal::Rename { olds, input });
+    }
+
+    /// Every name in the folder, hidden ones included.
+    pub fn existing_names(&self) -> Vec<String> {
+        self.entries.iter().map(|e| e.name.clone()).collect()
+    }
+
+    /// The preview rows of the open bulk rename.
+    pub fn bulk_rows(&self) -> Vec<rename::Row> {
+        match &self.modal {
+            Some(Modal::Rename { olds, input }) if olds.len() > 1 => {
+                rename::plan_bulk(&input.text, olds, &self.existing_names())
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// `Enter` in the rename dialog.
+    pub fn apply_rename(&mut self) {
+        let Some(Modal::Rename { olds, input }) = &self.modal else {
+            return;
+        };
+        let existing = self.existing_names();
+        let rows = if olds.len() == 1 {
+            vec![rename::plan_single(&olds[0], &input.text, &existing)]
+        } else {
+            rename::plan_bulk(&input.text, olds, &existing)
+        };
+        if let [row] = rows.as_slice() {
+            match row.problem {
+                Some(rename::Problem::Clash) => {
+                    return self.error(format!("“{}” already exists here", row.new));
+                }
+                Some(_) => return self.error("a name can't be empty, . or .., or contain /".into()),
+                None => {}
+            }
+        } else if rows.iter().any(|r| r.problem.is_some()) {
+            return self.error("fix the names marked ✗ first: empty, clashing or containing /".into());
+        }
+        self.modal = None;
+        let first = rows.first().map(|r| OsString::from(&r.new));
+        match rename::apply(&*self.vfs, &self.dir, &rows) {
+            Ok(0) => {}
+            Ok(1) => self.info(format!("renamed {} → {}", rows[0].old, rows[0].new)),
+            Ok(n) => self.info(format!("renamed {n} files")),
+            Err(e) => self.error(e),
+        }
+        self.selection.clear();
+        self.reload(first);
+    }
+
+    /// Re-reads the current folder after a file operation, keeping the
+    /// cursor on `focus`, on the same item, or else nearby.
+    fn reload(&mut self, focus: Option<OsString>) {
+        let anchor = self.visible.get(self.cursor).copied().unwrap_or(0);
+        let focus = focus.or_else(|| self.current().map(|e| e.file_name.clone()));
+        match self.vfs.list(&self.dir) {
+            Ok(mut entries) => {
+                sort_entries(&mut entries);
+                self.entries = entries;
+                self.count_folders();
+                self.refilter(focus.as_deref(), anchor);
+            }
+            Err(e) => {
+                let shown = self.display_path(&self.dir);
+                self.error(format!("can't reread {shown}: {e}"));
+            }
         }
     }
 
@@ -340,9 +492,7 @@ impl App {
 
     pub fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
-        let anchor = self.visible.get(self.cursor).copied().unwrap_or(0);
-        let name = self.current().map(|e| e.file_name.clone());
-        self.refilter(name.as_deref(), anchor);
+        self.refilter_here();
     }
 
     pub fn toggle_preview(&mut self) {
@@ -388,10 +538,6 @@ impl App {
             if let Some(&i) = index.get(&name) {
                 self.entries[i].children = n;
             }
-            let path = counted.dir.join(&name);
-            if let Some(s) = self.selection.iter_mut().find(|s| s.path == path) {
-                s.entry.children = n;
-            }
         }
         true
     }
@@ -416,30 +562,47 @@ impl App {
                 .insert(self.dir.clone(), e.file_name.clone());
         }
         let focus = focus.or_else(|| self.remembered.get(&dir).cloned());
-        let folders = entries
-            .iter()
-            .filter(|e| e.is_dir())
-            .map(|e| e.file_name.clone())
-            .collect();
-        self.counter.request(&dir, folders);
+        // Selection and filter belong to the folder they were made in.
+        self.selection.clear();
+        self.filter.clear();
+        self.filtering = false;
         self.dir = dir;
         self.entries = entries;
+        self.count_folders();
         self.refilter(focus.as_deref(), 0);
         Ok(())
     }
 
-    /// Recompute `visible` and put the cursor on `focus`, or else on the
-    /// first shown entry at or after `anchor` in `entries`.
+    fn count_folders(&self) {
+        let folders = self
+            .entries
+            .iter()
+            .filter(|e| e.is_dir())
+            .map(|e| e.file_name.clone())
+            .collect();
+        self.counter.request(&self.dir, folders);
+    }
+
+    /// Recompute `visible` from the hidden setting and the filter, drop
+    /// selected items that are no longer shown, and put the cursor on
+    /// `focus`, or else on the first shown entry at or after `anchor`.
     fn refilter(&mut self, focus: Option<&OsStr>, anchor: usize) {
         let show_hidden = self.show_hidden;
+        let query = self.filter.text.to_lowercase();
         self.visible = (0..self.entries.len())
-            .filter(|&i| show_hidden || !self.entries[i].is_hidden())
+            .filter(|&i| {
+                let e = &self.entries[i];
+                (show_hidden || !e.is_hidden()) && e.name.to_lowercase().contains(&query)
+            })
             .collect();
         let entries = &self.entries;
+        let visible = &self.visible;
+        self.selection
+            .retain(|n| visible.iter().any(|&i| entries[i].file_name == *n));
         self.cursor = focus
-            .and_then(|f| self.visible.iter().position(|&i| entries[i].file_name == f))
-            .or_else(|| self.visible.iter().position(|&i| i >= anchor))
-            .unwrap_or(self.visible.len().saturating_sub(1));
+            .and_then(|f| visible.iter().position(|&i| entries[i].file_name == f))
+            .or_else(|| visible.iter().position(|&i| i >= anchor))
+            .unwrap_or(visible.len().saturating_sub(1));
     }
 }
 

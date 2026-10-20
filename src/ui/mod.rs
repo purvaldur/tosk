@@ -1,3 +1,4 @@
+mod dialog;
 mod list;
 mod messages;
 mod preview;
@@ -11,6 +12,7 @@ use ratatui::style::Style;
 use ratatui::text::Span;
 
 use crate::app::App;
+use crate::text_input::TextInput;
 use crate::theme::*;
 
 pub const SIDEBAR_WIDTH: u16 = 18;
@@ -76,6 +78,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     status::render(app, buf, a.status);
     messages::render(app, buf, a.messages);
+    dialog::render(app, buf, area);
 }
 
 fn without_divider(area: Rect) -> Rect {
@@ -106,6 +109,23 @@ fn preview_body(area: Rect) -> Rect {
         width: b.width.saturating_sub(2),
         ..b
     }
+}
+
+/// A one-line text input with a block caret, scrolled so the caret shows.
+fn input_line(buf: &mut Buffer, x: u16, y: u16, w: u16, input: &TextInput, style: Style) {
+    if w == 0 {
+        return;
+    }
+    let mut before = input.before_cursor();
+    while width(before) >= w {
+        let mut chars = before.chars();
+        chars.next();
+        before = chars.as_str();
+    }
+    let start = input.before_cursor().len() - before.len();
+    put(buf, x, y, &input.text[start..], w, style);
+    let caret = x + width(before);
+    buf[(caret, y)].set_style(Style::default().bg(TEXT).fg(BASE));
 }
 
 /// The one-row pane header, in the accent colour when focused.

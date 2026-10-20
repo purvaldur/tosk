@@ -14,4 +14,12 @@ pub trait Vfs: Send + Sync {
     fn count_children(&self, dir: &Path) -> io::Result<usize>;
     /// The absolute path with every symlink resolved.
     fn resolve(&self, path: &Path) -> io::Result<PathBuf>;
+    /// Whether anything (a broken symlink included) exists at `path`.
+    fn exists(&self, path: &Path) -> bool;
+    /// Renames without checking the target; callers make sure it's free.
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    /// Moves to the freedesktop trash, restorable from any file manager.
+    fn trash(&self, paths: &[PathBuf]) -> io::Result<()>;
+    /// Removes for good. Symlinks are removed, never followed.
+    fn delete(&self, path: &Path) -> io::Result<()>;
 }
