@@ -15,6 +15,7 @@ use crate::fs::Vfs;
 const BATCH_EVERY: Duration = Duration::from_millis(30);
 
 struct Job {
+    vfs: Arc<dyn Vfs>,
     generation: u64,
     dir: PathBuf,
     names: Vec<OsString>,
@@ -33,14 +34,14 @@ pub struct Counter {
 }
 
 impl Counter {
-    pub fn spawn(vfs: Arc<dyn Vfs>) -> Counter {
+    pub fn spawn() -> Counter {
         let (jobs, job_rx) = mpsc::channel::<Job>();
         let (result_tx, results) = mpsc::channel();
         let generation = Arc::new(AtomicU64::new(0));
         let current = generation.clone();
         thread::spawn(move || {
             for job in job_rx {
-                if !run(&*vfs, job, &current, &result_tx) {
+                if !run(job, &current, &result_tx) {
                     break;
                 }
             }
@@ -54,12 +55,13 @@ impl Counter {
 
     /// Count the children of each named folder in `dir`, replacing any
     /// request still in progress.
-    pub fn request(&self, dir: &Path, names: Vec<OsString>) {
+    pub fn request(&self, vfs: Arc<dyn Vfs>, dir: &Path, names: Vec<OsString>) {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         if names.is_empty() {
             return;
         }
         let _ = self.jobs.send(Job {
+            vfs,
             generation,
             dir: dir.to_path_buf(),
             names,
@@ -68,7 +70,8 @@ impl Counter {
 }
 
 /// Returns false once the receiving side is gone.
-fn run(vfs: &dyn Vfs, job: Job, current: &AtomicU64, tx: &Sender<Counted>) -> bool {
+fn run(job: Job, current: &AtomicU64, tx: &Sender<Counted>) -> bool {
+    let vfs = &*job.vfs;
     let mut batch = Vec::new();
     let mut last = Instant::now();
     for name in job.names {
@@ -114,8 +117,12 @@ mod tests {
         fs::create_dir_all(r.join("a/x")).unwrap();
         fs::write(r.join("a/y"), "").unwrap();
         fs::create_dir(r.join("empty")).unwrap();
-        let c = Counter::spawn(Arc::new(Local));
-        c.request(r, vec!["a".into(), "empty".into(), "gone".into()]);
+        let c = Counter::spawn();
+        c.request(
+            Arc::new(Local),
+            r,
+            vec!["a".into(), "empty".into(), "gone".into()],
+        );
         let mut got = Vec::new();
         while got.len() < 3 {
             let batch = c.results.recv_timeout(Duration::from_secs(5)).unwrap();

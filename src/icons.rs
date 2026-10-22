@@ -11,6 +11,8 @@ pub const MUSIC: char = '\u{f001}';
 pub const PICTURES: char = '\u{f03e}';
 pub const VIDEOS: char = '\u{f008}';
 pub const PINNED: char = '\u{f02e}';
+/// A server, for network hosts.
+pub const SERVER: char = '\u{f0473}';
 
 const FOLDER: char = '\u{f07b}';
 const FOLDER_LINK: char = '\u{f482}';

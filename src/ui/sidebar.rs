@@ -60,20 +60,21 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect) {
             (ON_ACCENT, ON_ACCENT)
         } else if here == Some(i) {
             (ACCENT, ACCENT)
+        } else if items[i].host.is_some() {
+            (TEAL, TEAL)
         } else {
             (OVERLAY0, TEXT)
         };
-        let mut glyph = [0; 4];
         let s = &items[i];
-        let glyph = s.icon.encode_utf8(&mut glyph);
-        put(buf, r.x + 1, r.y, glyph, 1, Style::default().fg(icon));
-        put(
-            buf,
-            r.x + 3,
-            r.y,
-            &s.label,
-            r.width.saturating_sub(4),
-            Style::default().fg(label),
-        );
+        let label_x = if app.icons {
+            let mut glyph = [0; 4];
+            let glyph = s.icon.encode_utf8(&mut glyph);
+            put(buf, r.x + 1, r.y, glyph, 1, Style::default().fg(icon));
+            r.x + 3
+        } else {
+            r.x + 1
+        };
+        let w = r.right().saturating_sub(label_x + 1);
+        put(buf, label_x, r.y, &s.label, w, Style::default().fg(label));
     }
 }

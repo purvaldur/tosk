@@ -1,11 +1,22 @@
+pub mod lister;
 pub mod local;
+pub mod sftp;
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::entry::Entry;
 
-/// Filesystem access, so the remote backend (milestone 9) can slot in.
+/// An entry with the details properties shows.
+pub struct Meta {
+    pub entry: Entry,
+    /// The raw `st_mode`, of the target for a symlink.
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Filesystem access, local or over ssh.
 pub trait Vfs: Send + Sync {
     /// Every entry in `dir`, unsorted, hidden ones included. Folder item
     /// counts are left out; they come from `count_children` on a worker.
@@ -25,4 +36,8 @@ pub trait Vfs: Send + Sync {
     fn create_dir(&self, path: &Path) -> io::Result<()>;
     /// Removes for good. Symlinks are removed, never followed.
     fn delete(&self, path: &Path) -> io::Result<()>;
+    /// At most `max` bytes from the start of a file.
+    fn read(&self, path: &Path, max: u64) -> io::Result<Vec<u8>>;
+    /// The entry for `path` itself, with mode and owner.
+    fn stat(&self, path: &Path) -> io::Result<Meta>;
 }

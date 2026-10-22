@@ -13,12 +13,15 @@ use jiff::Zoned;
 use jiff::tz::TimeZone;
 use ratatui_image::picker::Picker;
 
-use crate::command::Command;
+use crate::command::{Action, Command};
+use crate::config::{self, Config, Custom, Where};
 use crate::counts::{Counted, Counter};
 use crate::entry::{Entry, Kind};
 use crate::format::{count, selection_summary, tilde};
 use crate::fs::Vfs;
+use crate::fs::lister::{Listed, Lister};
 use crate::fs::local::Local;
+use crate::fs::sftp::{Host, Sftp};
 use crate::git::{GitStatus, GitWatcher};
 use crate::grep::ContentSearch;
 use crate::help::HelpState;
@@ -29,7 +32,7 @@ use crate::picker::FilePicker;
 use crate::preview::{self, FileKind, Previewer, classify};
 use crate::props::Props;
 use crate::rename;
-use crate::shortcuts::{Pin, Shortcuts};
+use crate::shortcuts::{Group, Pin, Shortcuts};
 use crate::sort::{Sort, sort_entries};
 use crate::term_panel::TermPanel;
 use crate::text_input::TextInput;
@@ -53,6 +56,21 @@ const FOCUS_CYCLE: &[Focus] = &[Focus::Sidebar, Focus::Files];
 pub struct Message {
     pub text: String,
     pub error: bool,
+}
+
+/// A remote trash or delete that finished: the folder it ran in, and the
+/// outcome.
+type Removed = (PathBuf, Message);
+
+/// A remote folder being listed on the worker.
+pub struct Loading {
+    id: u64,
+    sftp: Arc<Sftp>,
+    /// The address being opened, for the header meanwhile.
+    pub shown: String,
+    focus: Option<OsString>,
+    /// Re-reading the current folder: where the cursor was.
+    reload: Option<usize>,
 }
 
 pub struct App {
@@ -94,12 +112,29 @@ pub struct App {
     /// Newest first, at most two.
     pub messages: VecDeque<Message>,
     pub keymap: Keymap,
+    /// Commands from `[commands.*]` in the config.
+    pub custom: Vec<Custom>,
+    /// Nerd Font icons in the sidebar and list.
+    pub icons: bool,
+    /// The kitty user variable of the editor window.
+    editor_role: String,
     pub quit: bool,
     pub home: Option<PathBuf>,
     pub tz: TimeZone,
     pub this_year: i16,
-    /// Name under the cursor, per folder, for the session.
-    remembered: HashMap<PathBuf, OsString>,
+    /// Name under the cursor, per folder (by its shown address), for the
+    /// session.
+    remembered: HashMap<String, OsString>,
+    /// The server `dir` is on; `None` for this machine.
+    pub remote: Option<Arc<Sftp>>,
+    /// Connections opened this session, reused when coming back.
+    connections: HashMap<Host, Arc<Sftp>>,
+    lister: Lister,
+    pub loading: Option<Loading>,
+    next_load: u64,
+    /// Remote trash and delete finishing in the background: the folder
+    /// they ran in, and the outcome.
+    removed: (Sender<Removed>, Receiver<Removed>),
     counter: Counter,
     /// The work tree `dir` is in, for the segment and the file marks;
     /// `None` outside one.
@@ -115,17 +150,42 @@ pub struct App {
 impl App {
     /// `picker` is set when the terminal speaks kitty graphics. Pinned
     /// shortcuts are kept in `pins`, or only in memory when it's `None`.
+    #[cfg(test)]
     pub fn new(dir: PathBuf, picker: Option<Picker>, pins: Option<PathBuf>) -> Result<App> {
+        App::with_config(dir, picker, pins, Config::default())
+    }
+
+    /// Like `new`, set up from the config. Its problems, and keys that
+    /// couldn't be bound, open in a dialog.
+    pub fn with_config(
+        dir: PathBuf,
+        picker: Option<Picker>,
+        pins: Option<PathBuf>,
+        config: Config,
+    ) -> Result<App> {
         let now = Zoned::now();
+        let mut keymap = Keymap::defaults();
+        let mut problems = config.problems.clone();
+        problems.extend(keymap.configure(&config.keys, &config.commands));
         let home = dirs::home_dir();
         let vfs: Arc<dyn Vfs> = Arc::new(Local);
+        // Hosts from the ssh config only for a real run, like the pins.
+        let ssh_config = home
+            .as_ref()
+            .filter(|_| pins.is_some())
+            .map(|h| h.join(".ssh/config"));
         let mut app = App {
             dir: dir.clone(),
             entries: Vec::new(),
             visible: Vec::new(),
             cursor: 0,
             focus: Focus::Files,
-            shortcuts: Shortcuts::load(home.as_deref(), pins),
+            shortcuts: Shortcuts::load(
+                home.as_deref(),
+                pins,
+                ssh_config.as_deref(),
+                config.hosts(),
+            ),
             side_cursor: 0,
             selection: Vec::new(),
             filter: TextInput::default(),
@@ -136,20 +196,29 @@ impl App {
             focus_before_terminal: Focus::Files,
             shell: std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()),
             terminal_size: (6, 80),
-            show_hidden: false,
+            show_hidden: config.general.show_hidden,
             sort: Sort::default(),
-            preview: true,
+            preview: config.general.preview,
             show_log: true,
             preview_key: None,
-            previewer: Previewer::spawn(vfs.clone(), picker),
+            previewer: Previewer::spawn(picker),
             messages: VecDeque::new(),
-            keymap: Keymap::defaults(),
+            keymap,
+            custom: config.commands,
+            icons: config.sidebar.icons,
+            editor_role: config.general.editor_role,
             quit: false,
             home,
             tz: now.time_zone().clone(),
             this_year: now.year(),
             remembered: HashMap::new(),
-            counter: Counter::spawn(vfs.clone()),
+            remote: None,
+            connections: HashMap::new(),
+            lister: Lister::spawn(),
+            loading: None,
+            next_load: 0,
+            removed: mpsc::channel(),
+            counter: Counter::spawn(),
             git: None,
             git_watch: GitWatcher::spawn(),
             git_asked: Instant::now(),
@@ -158,6 +227,12 @@ impl App {
         };
         app.load(dir.clone(), None)
             .with_context(|| format!("can't open {}", dir.display()))?;
+        if !problems.is_empty() {
+            app.modal = Some(Modal::Notice {
+                title: "config.toml".into(),
+                lines: problems,
+            });
+        }
         Ok(app)
     }
 
@@ -167,11 +242,31 @@ impl App {
 
     /// The shortcut to highlight: the deepest one containing the current folder.
     pub fn here(&self) -> Option<usize> {
-        self.shortcuts.deepest_match(&self.dir)
+        let host = self.remote.as_ref().map(|r| &r.host);
+        self.shortcuts.deepest_match(host, &self.dir)
     }
 
+    /// A path where tosk is: `~/x` here, `ssh://host/x` on a server.
     pub fn display_path(&self, path: &Path) -> String {
-        tilde(path, self.home.as_deref())
+        match &self.remote {
+            Some(r) => r.host.uri(Some(path)),
+            None => tilde(path, self.home.as_deref()),
+        }
+    }
+
+    /// The server tosk is on, if any.
+    pub fn host(&self) -> Option<&Host> {
+        self.remote.as_ref().map(|r| &r.host)
+    }
+
+    /// Refuses a command that only works on this machine; returns whether
+    /// it did.
+    fn local_only(&mut self, what: &str) -> bool {
+        let Some(host) = self.host().map(Host::to_string) else {
+            return false;
+        };
+        self.error(format!("{what} works on this machine, not on {host}"));
+        true
     }
 
     pub fn info(&mut self, text: String) {
@@ -227,7 +322,13 @@ impl App {
     fn focus_terminal(&mut self) -> bool {
         if self.terminal.is_none() {
             let (rows, cols) = self.terminal_size;
-            match TermPanel::spawn(&self.shell, &self.dir, rows, cols) {
+            // Over ssh, the shell is still a local one.
+            let cwd = match (&self.remote, &self.home) {
+                (None, _) => self.dir.clone(),
+                (Some(_), Some(home)) => home.clone(),
+                (Some(_), None) => PathBuf::from("/"),
+            };
+            match TermPanel::spawn(&self.shell, &cwd, rows, cols) {
                 Ok(t) => self.terminal = Some(t),
                 Err(e) => {
                     self.error(format!("can't start a shell: {e}"));
@@ -256,10 +357,15 @@ impl App {
             return self.error("x runs .sh files".into());
         }
         let path = self.dir.join(&e.file_name);
+        let quoted = clipboard::shell_quote(&path.to_string_lossy());
+        // On a server, through an interactive ssh in the local panel.
+        let line = match self.host() {
+            Some(h) => format!("ssh -t {} bash {quoted}\r", h.ssh_args().join(" ")),
+            None => format!("bash {quoted}\r"),
+        };
         if self.focus_terminal()
             && let Some(t) = &mut self.terminal
         {
-            let line = format!("bash {}\r", clipboard::shell_quote(&path.to_string_lossy()));
             t.write(line.as_bytes());
         }
     }
@@ -297,10 +403,19 @@ impl App {
     /// In the sidebar, jumps to the shortcut and hands focus back to the list.
     pub fn nav_enter(&mut self) {
         if self.focus == Focus::Sidebar {
-            let Some(shortcut) = self.shortcuts.items.get(self.side_cursor) else {
+            let Some(s) = self.shortcuts.items.get(self.side_cursor) else {
                 return;
             };
-            if self.go(shortcut.path.clone(), None) {
+            let (host, path) = (s.host.clone(), s.path.clone());
+            let opened = match host {
+                Some(host) => {
+                    let path = (!path.as_os_str().is_empty()).then_some(path);
+                    self.go_host(host, path);
+                    true
+                }
+                None => self.go_local(path, None),
+            };
+            if opened {
                 self.focus = Focus::Files;
             }
             return;
@@ -385,18 +500,81 @@ impl App {
         }
     }
 
+    /// A command's title for menus.
+    pub fn action_title(&self, action: Action) -> String {
+        match action {
+            Action::Builtin(c) => c.title().to_string(),
+            Action::Custom(i) => self
+                .custom
+                .get(i)
+                .map(|c| c.title.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// A command's id, as written in the config.
+    pub fn action_id(&self, action: Action) -> String {
+        match action {
+            Action::Builtin(c) => c.id().to_string(),
+            Action::Custom(i) => self.custom.get(i).map(|c| c.id.clone()).unwrap_or_default(),
+        }
+    }
+
+    /// Runs a command from `[commands.*]`, its placeholders filled in from
+    /// the cursor, the folder and the selection.
+    pub fn run_custom(&mut self, i: usize) {
+        let Some(c) = self.custom.get(i).cloned() else {
+            return;
+        };
+        if self.local_only(&c.title) {
+            return;
+        }
+        let file = self.current().map(|e| self.dir.join(&e.file_name));
+        let selection = self.targets();
+        let cx = config::Context {
+            file: file.as_deref(),
+            dir: &self.dir,
+            selection: &selection,
+        };
+        let line = match config::expand(&c.run, &cx) {
+            Ok(l) => l,
+            Err(e) => return self.error(format!("{}: {e}", c.title)),
+        };
+        match c.place {
+            Where::Terminal => {
+                if self.focus_terminal()
+                    && let Some(t) = &mut self.terminal
+                {
+                    t.write(format!("{line}\r").as_bytes());
+                }
+            }
+            Where::Background => {
+                let (tx, dir) = (self.jobs.0.clone(), self.dir.clone());
+                thread::spawn(move || {
+                    let _ = tx.send(run_detached(&c.title, &line, &dir));
+                });
+            }
+        }
+    }
+
     /// `p`: properties of the selection, or of the cursor item.
     pub fn open_props(&mut self) {
         let targets = self.targets();
         if targets.is_empty() {
             return;
         }
-        let props = Props::new(&targets, self.home.as_deref(), &self.tz);
+        let props = match &self.remote {
+            Some(r) => Props::remote(self.vfs.clone(), &r.host, &targets, &self.tz),
+            None => Props::new(&targets, self.home.as_deref(), &self.tz),
+        };
         self.modal = Some(Modal::Props(Box::new(props)));
     }
 
     /// Asks for a fresh git status for the current folder.
     fn refresh_git(&mut self) {
+        if self.remote.is_some() {
+            return;
+        }
         self.git_watch.request(&self.dir);
         self.git_asked = Instant::now();
     }
@@ -411,6 +589,9 @@ impl App {
 
     /// `f`: find files under the current folder.
     pub fn open_picker(&mut self) {
+        if self.local_only("the file picker") {
+            return;
+        }
         let picker = FilePicker::open(self.dir.clone(), self.show_hidden);
         self.modal = Some(Modal::Picker(Box::new(picker)));
         self.focus = Focus::Files;
@@ -418,6 +599,9 @@ impl App {
 
     /// `F`: search the contents of files under the current folder.
     pub fn open_search(&mut self) {
+        if self.local_only("content search") {
+            return;
+        }
         let search = ContentSearch::open(self.dir.clone(), self.show_hidden);
         self.modal = Some(Modal::Search(Box::new(search)));
         self.focus = Focus::Files;
@@ -500,22 +684,19 @@ impl App {
         let Some(Modal::Confirm { delete, paths }) = self.modal.take() else {
             return;
         };
-        let n = paths.len();
-        let result = if delete {
-            paths
-                .iter()
-                .enumerate()
-                .try_for_each(|(i, p)| self.vfs.delete(p).map_err(|e| (i, e)))
-        } else {
-            self.vfs.trash(&paths).map_err(|e| (0, e))
-        };
-        match (result, delete) {
-            (Ok(()), false) => self.info(format!("{n} moved to trash, restorable")),
-            (Ok(()), true) => self.info(format!("{n} deleted for good")),
-            (Err((_, e)), false) => self.error(format!("can't move to trash: {e}")),
-            (Err((i, e)), true) => self.error(format!("deleted {i} of {n}, then: {e}")),
-        }
         self.selection.clear();
+        // Over ssh it can take a while: finish in the background.
+        if self.remote.is_some() {
+            let (vfs, tx, dir) = (self.vfs.clone(), self.removed.0.clone(), self.dir.clone());
+            let verb = if delete { "deleting" } else { "trashing" };
+            self.info(format!("{verb} {}…", count(paths.len(), "item", "items")));
+            thread::spawn(move || {
+                let _ = tx.send((dir, remove(&*vfs, &paths, delete)));
+            });
+            return;
+        }
+        let m = remove(&*self.vfs, &paths, delete);
+        self.push_message(m.text, m.error);
         self.reload(None);
     }
 
@@ -639,6 +820,9 @@ impl App {
     fn reload(&mut self, focus: Option<OsString>) {
         let anchor = self.visible.get(self.cursor).copied().unwrap_or(0);
         let focus = focus.or_else(|| self.current().map(|e| e.file_name.clone()));
+        if let Some(sftp) = self.remote.clone() {
+            return self.go_remote(sftp, Some(self.dir.clone()), focus, Some(anchor));
+        }
         match self.vfs.list(&self.dir) {
             Ok(mut entries) => {
                 sort_entries(&mut entries, self.sort);
@@ -659,6 +843,9 @@ impl App {
     pub fn open_editor(&mut self) {
         let targets = self.targets();
         let Some(first) = targets.first() else { return };
+        if let Some(sftp) = self.remote.clone() {
+            return self.edit_remote(sftp, targets);
+        }
         if targets.len() == 1 && first.is_dir() {
             let dir = first.clone();
             let shown = self.display_path(&dir);
@@ -674,6 +861,53 @@ impl App {
             }
         }
         self.edit_files(targets, None);
+    }
+
+    /// `e` on a server: Helix runs there, in a new kitty tab over
+    /// `kitten ssh`. Files are checked for text on the job's thread.
+    fn edit_remote(&mut self, sftp: Arc<Sftp>, targets: Vec<PathBuf>) {
+        let dirs: Vec<bool> = targets
+            .iter()
+            .map(|p| {
+                self.entries
+                    .iter()
+                    .any(|e| e.is_dir() && self.dir.join(&e.file_name) == *p)
+            })
+            .collect();
+        let quote = |p: &Path| clipboard::shell_quote(&p.to_string_lossy());
+        let host = sftp.host.clone();
+        if let ([dir], [true]) = (targets.as_slice(), dirs.as_slice()) {
+            let script = format!("cd {} && exec hx .", quote(dir));
+            let shown = host.uri(Some(dir));
+            return self.job(move |k| {
+                k.launch_ssh(&host.ssh_args(), &script)
+                    .map(|()| format!("started Helix in {shown}, in a new tab"))
+            });
+        }
+        if dirs.contains(&true) {
+            return self.error("e edits one folder, or files".into());
+        }
+        let script = format!(
+            "exec hx {}",
+            targets
+                .iter()
+                .map(|p| quote(p))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        self.job(move |k| {
+            for path in &targets {
+                let head = sftp
+                    .read(path, 8 * 1024)
+                    .map_err(|e| format!("can't read {}: {e}", path.display()))?;
+                if classify(path, &head) != FileKind::Text {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    return Err(format!("e edits text files; {name} isn't one"));
+                }
+            }
+            k.launch_ssh(&host.ssh_args(), &script)
+                .map(|()| format!("started Helix on {host}, in a new tab"))
+        });
     }
 
     /// Opens text files in Helix, the first one at `line` if given.
@@ -701,7 +935,7 @@ impl App {
 
     /// Runs a kitty call on a thread; its outcome arrives as a message.
     fn job(&mut self, f: impl FnOnce(&Kitty) -> Result<String, String> + Send + 'static) {
-        let kitty = match Kitty::from_env("helix") {
+        let kitty = match Kitty::from_env(&self.editor_role) {
             Ok(k) => k,
             Err(e) => return self.error(e),
         };
@@ -723,14 +957,50 @@ impl App {
         }
         let path = self.dir.join(&e.file_name);
         let name = e.name.clone();
+        if let Some(sftp) = self.remote.clone() {
+            return self.open_remote(sftp, path, name);
+        }
         match launch::xdg_open(&path) {
             Ok(()) => self.info(format!("opened {name} with xdg-open")),
             Err(err) => self.error(format!("can't run xdg-open: {err}")),
         }
     }
 
+    /// A remote file is downloaded to `/tmp/tosk/<host>/` first, on a
+    /// thread, then opened like a local one.
+    fn open_remote(&mut self, sftp: Arc<Sftp>, path: PathBuf, name: String) {
+        let dir = std::env::temp_dir()
+            .join("tosk")
+            .join(sftp.host.to_string());
+        let dest = dir.join(&name);
+        self.info(format!("downloading {name}…"));
+        let tx = self.jobs.0.clone();
+        thread::spawn(move || {
+            let result = std::fs::create_dir_all(&dir)
+                .and_then(|()| sftp.download(&path, &dest))
+                .map_err(|e| format!("can't download {name}: {e}"))
+                .and_then(|_| {
+                    launch::xdg_open(&dest).map_err(|e| format!("can't run xdg-open: {e}"))
+                });
+            let message = match result {
+                Ok(()) => Message {
+                    text: format!(
+                        "opened {name} with xdg-open, from a copy in {}",
+                        dir.display()
+                    ),
+                    error: false,
+                },
+                Err(text) => Message { text, error: true },
+            };
+            let _ = tx.send(message);
+        });
+    }
+
     /// The files themselves, as a uri-list GUI apps paste as files.
     pub fn copy_files(&mut self) {
+        if self.local_only("c (copy files)") {
+            return self.info("C copies the path instead".into());
+        }
         let targets = self.targets();
         if targets.is_empty() {
             return;
@@ -752,7 +1022,20 @@ impl App {
             return;
         }
         let paths: Vec<&Path> = targets.iter().map(PathBuf::as_path).collect();
-        let text = clipboard::shell_words(&paths);
+        // On a server, as `host:path`, ready for scp or rsync.
+        let text = match self.host() {
+            Some(h) if h.port.is_none() => paths
+                .iter()
+                .map(|p| format!("{h}:{}", clipboard::shell_quote(&p.to_string_lossy())))
+                .collect::<Vec<_>>()
+                .join(" "),
+            Some(h) => paths
+                .iter()
+                .map(|p| clipboard::shell_quote(&h.uri(Some(p))))
+                .collect::<Vec<_>>()
+                .join(" "),
+            None => clipboard::shell_words(&paths),
+        };
         match clipboard::copy(None, &text) {
             Ok(()) if paths.len() == 1 => {
                 let shown = self.display_path(paths[0]);
@@ -766,22 +1049,36 @@ impl App {
     /// In the file list: pin the folder under the cursor, or the current
     /// folder when the cursor is on a file. In the sidebar: unpin.
     pub fn toggle_pin(&mut self) {
-        let path = match self.focus {
-            Focus::Sidebar => match self.shortcuts.items.get(self.side_cursor) {
-                Some(s) => s.path.clone(),
-                None => return,
-            },
-            Focus::Files | Focus::Terminal => match self.current() {
+        let result = if self.focus == Focus::Sidebar {
+            let Some(s) = self.shortcuts.items.get(self.side_cursor) else {
+                return;
+            };
+            let shown = s.label.clone();
+            let from_config = s.group == Group::Network && !s.saved;
+            match self.shortcuts.unpin_at(self.side_cursor) {
+                Ok(Pin::BuiltIn) if from_config => {
+                    let text = format!("{shown} comes from ~/.ssh/config; remove it there");
+                    return self.info(text);
+                }
+                other => (other, shown),
+            }
+        } else {
+            let path = match self.current() {
                 Some(e) if e.is_dir() => self.dir.join(&e.file_name),
                 _ => self.dir.clone(),
-            },
+            };
+            let shown = self.display_path(&path);
+            let pinned = match self.remote.clone() {
+                Some(r) => self.shortcuts.toggle_pin_remote(&r.host, Some(&path)),
+                None => self.shortcuts.toggle_pin(&path),
+            };
+            (pinned, shown)
         };
-        let shown = self.display_path(&path);
-        match self.shortcuts.toggle_pin(&path) {
-            Ok(Pin::Pinned) => self.info(format!("pinned {shown} to the shortcuts")),
-            Ok(Pin::Unpinned) => self.info(format!("unpinned {shown}")),
-            Ok(Pin::BuiltIn) => self.info(format!("{shown} is a built-in shortcut")),
-            Err(err) => self.error(format!("can't save shortcuts: {err}")),
+        match result {
+            (Ok(Pin::Pinned), shown) => self.info(format!("pinned {shown} to the shortcuts")),
+            (Ok(Pin::Unpinned), shown) => self.info(format!("unpinned {shown}")),
+            (Ok(Pin::BuiltIn), shown) => self.info(format!("{shown} is a built-in shortcut")),
+            (Err(err), _) => self.error(format!("can't save shortcuts: {err}")),
         }
         self.side_cursor = self
             .side_cursor
@@ -838,10 +1135,16 @@ impl App {
                 mtime: e.mtime,
                 size,
                 line: None,
+                host: self.host().cloned(),
             }),
         };
         if let Some(key) = &self.preview_key {
-            self.previewer.want(key);
+            // Picker files are always local.
+            let vfs = match key.host {
+                Some(_) => self.vfs.clone(),
+                None => Arc::new(Local),
+            };
+            self.previewer.want(key, vfs);
         }
     }
 
@@ -882,11 +1185,21 @@ impl App {
             }
         }
         // Commits and edits made elsewhere show up within a few seconds.
-        if self.git_asked.elapsed() >= GIT_REFRESH {
+        if self.remote.is_none() && self.git_asked.elapsed() >= GIT_REFRESH {
             self.refresh_git();
         }
         while let Ok(counted) = self.counter.results.try_recv() {
             changed |= self.apply_counts(counted);
+        }
+        while let Ok(listed) = self.lister.results.try_recv() {
+            changed |= self.apply_listing(listed);
+        }
+        while let Ok((dir, m)) = self.removed.1.try_recv() {
+            self.push_message(m.text, m.error);
+            if self.remote.is_some() && dir == self.dir {
+                self.reload(None);
+            }
+            changed = true;
         }
         changed
     }
@@ -909,33 +1222,135 @@ impl App {
         true
     }
 
-    /// Switch folders, reporting a failure as a message. Returns whether it worked.
+    /// Switch folders where tosk is (here or on the server), reporting a
+    /// failure as a message. Returns whether it worked, or for a server,
+    /// that the listing is on its way.
     fn go(&mut self, dir: PathBuf, focus: Option<OsString>) -> bool {
+        if let Some(sftp) = self.remote.clone() {
+            self.go_remote(sftp, Some(dir), focus, None);
+            return true;
+        }
+        self.go_local(dir, focus)
+    }
+
+    /// A folder on this machine, leaving the server if tosk is on one.
+    fn go_local(&mut self, dir: PathBuf, focus: Option<OsString>) -> bool {
         match self.load(dir.clone(), focus) {
             Ok(()) => true,
             Err(err) => {
-                let shown = self.display_path(&dir);
+                let shown = tilde(&dir, self.home.as_deref());
                 self.error(format!("can't open {shown}: {err}"));
                 false
             }
         }
     }
 
+    /// Opens `path` on `host` (its home folder for `None`), connecting
+    /// first if need be.
+    pub fn go_host(&mut self, host: Host, path: Option<PathBuf>) {
+        let sftp = self
+            .connections
+            .entry(host.clone())
+            .or_insert_with(|| Arc::new(Sftp::new(host)))
+            .clone();
+        self.go_remote(sftp, path, None, None);
+    }
+
+    /// Lists a remote folder on the worker; the result arrives through
+    /// `apply_listing`. A newer request replaces this one.
+    fn go_remote(
+        &mut self,
+        sftp: Arc<Sftp>,
+        dir: Option<PathBuf>,
+        focus: Option<OsString>,
+        reload: Option<usize>,
+    ) {
+        self.next_load += 1;
+        let id = self.next_load;
+        self.loading = Some(Loading {
+            id,
+            sftp: sftp.clone(),
+            shown: sftp.host.uri(dir.as_deref()),
+            focus,
+            reload,
+        });
+        self.lister.request(id, sftp, dir);
+    }
+
+    /// A remote listing came back; returns whether it was the one waited for.
+    fn apply_listing(&mut self, listed: Listed) -> bool {
+        if self.loading.as_ref().is_none_or(|l| l.id != listed.id) {
+            return false;
+        }
+        let Some(l) = self.loading.take() else {
+            return false;
+        };
+        let mut entries = match listed.result {
+            Ok(entries) => entries,
+            Err(e) => {
+                let hint = connect_hint(&e.to_string(), &l.sftp.host);
+                self.error(format!("can't open {}: {e}{hint}", l.shown));
+                return true;
+            }
+        };
+        let same_place = self
+            .remote
+            .as_ref()
+            .is_some_and(|r| Arc::ptr_eq(r, &l.sftp))
+            && listed.dir == self.dir;
+        match l.reload {
+            Some(anchor) if same_place => {
+                sort_entries(&mut entries, self.sort);
+                self.entries = entries;
+                self.count_folders();
+                self.refilter(l.focus.as_deref(), anchor);
+            }
+            _ => {
+                let vfs: Arc<dyn Vfs> = l.sftp.clone();
+                self.show(Some(l.sftp), vfs, listed.dir, entries, l.focus);
+            }
+        }
+        true
+    }
+
+    /// Lists a local folder right away.
     fn load(&mut self, dir: PathBuf, focus: Option<OsString>) -> io::Result<()> {
-        let mut entries = self.vfs.list(&dir)?;
+        // Coming back from a server, files are local again.
+        let vfs: Arc<dyn Vfs> = match self.remote {
+            Some(_) => Arc::new(Local),
+            None => self.vfs.clone(),
+        };
+        let entries = vfs.list(&dir)?;
+        self.show(None, vfs, dir, entries, focus);
+        Ok(())
+    }
+
+    /// Makes `dir` (on `remote`, read through `vfs`) the current folder.
+    fn show(
+        &mut self,
+        remote: Option<Arc<Sftp>>,
+        vfs: Arc<dyn Vfs>,
+        dir: PathBuf,
+        mut entries: Vec<Entry>,
+        focus: Option<OsString>,
+    ) {
         sort_entries(&mut entries, self.sort);
         if let Some(e) = self.current() {
-            self.remembered
-                .insert(self.dir.clone(), e.file_name.clone());
+            let place = self.display_path(&self.dir);
+            self.remembered.insert(place, e.file_name.clone());
         }
-        let focus = focus.or_else(|| self.remembered.get(&dir).cloned());
+        // Whatever was loading is overtaken.
+        self.loading = None;
+        self.remote = remote;
+        self.vfs = vfs;
+        let focus = focus.or_else(|| self.remembered.get(&self.display_path(&dir)).cloned());
         // Selection and filter belong to the folder they were made in.
         self.selection.clear();
         self.filter.clear();
         self.filtering = false;
         // Within the same work tree the old status stays up while the
         // new one comes, so the segment and marks don't blink.
-        if self.git.as_ref().is_some_and(|g| !dir.starts_with(&g.root)) {
+        if self.remote.is_some() || self.git.as_ref().is_some_and(|g| !dir.starts_with(&g.root)) {
             self.git = None;
         }
         self.dir = dir;
@@ -943,7 +1358,6 @@ impl App {
         self.count_folders();
         self.refresh_git();
         self.refilter(focus.as_deref(), 0);
-        Ok(())
     }
 
     fn count_folders(&self) {
@@ -953,7 +1367,64 @@ impl App {
             .filter(|e| e.is_dir())
             .map(|e| e.file_name.clone())
             .collect();
-        self.counter.request(&self.dir, folders);
+        self.counter.request(self.vfs.clone(), &self.dir, folders);
+    }
+
+    /// `Ctrl-l`: type where to go.
+    pub fn start_goto(&mut self) {
+        self.modal = Some(Modal::Goto(TextInput::default()));
+    }
+
+    /// `Enter` in the go-to dialog: `ssh://…` or `host:path` opens a server;
+    /// anything else is a path where tosk is, with `~` for home there.
+    pub fn apply_goto(&mut self) {
+        let Some(Modal::Goto(input)) = &self.modal else {
+            return;
+        };
+        let text = input.text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.modal = None;
+        let looks_remote = text.starts_with("ssh://")
+            || (text.contains(':') && !text.starts_with(['/', '~', '.']));
+        if looks_remote {
+            match Host::parse(&text) {
+                Some((host, path)) => self.go_host(host, path),
+                None => self.error(format!(
+                    "can't read “{text}” as ssh://[user@]host[:port]/path or host:path"
+                )),
+            }
+            return;
+        }
+        let home_rest = match text.as_str() {
+            "~" => Some(""),
+            t => t.strip_prefix("~/"),
+        };
+        if let Some(sftp) = self.remote.clone() {
+            let path = match home_rest {
+                Some("") => None,
+                Some(rest) => match sftp.home() {
+                    Ok(home) => Some(home.join(rest)),
+                    Err(e) => return self.error(format!("can't find the home folder: {e}")),
+                },
+                None => Some(self.dir.join(&text)),
+            };
+            return self.go_remote(sftp, path, None, None);
+        }
+        let path = match (home_rest, &self.home) {
+            (Some(rest), Some(home)) => home.join(rest),
+            _ => self.dir.join(&text),
+        };
+        // A file: its folder, with the cursor on it.
+        if path.is_file()
+            && let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+        {
+            let name = name.to_os_string();
+            self.go_local(parent.to_path_buf(), Some(name));
+        } else {
+            self.go_local(path, None);
+        }
     }
 
     /// Recompute `visible` from the hidden setting and the filter, drop
@@ -976,6 +1447,69 @@ impl App {
             .and_then(|f| visible.iter().position(|&i| entries[i].file_name == f))
             .or_else(|| visible.iter().position(|&i| i >= anchor))
             .unwrap_or(visible.len().saturating_sub(1));
+    }
+}
+
+/// Runs a custom command with `sh -c` in `dir` and reports how it went,
+/// with the last thing it said on stderr when it failed.
+fn run_detached(title: &str, line: &str, dir: &Path) -> Message {
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(line)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output();
+    let (text, error) = match out {
+        Ok(o) if o.status.success() => (format!("{title}: done"), false),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let said = err.lines().map(str::trim).rfind(|l| !l.is_empty());
+            let why = match (said, o.status.code()) {
+                (Some(line), _) => line.to_string(),
+                (None, Some(code)) => format!("exit code {code}"),
+                (None, None) => "killed".to_string(),
+            };
+            (format!("{title} failed: {why}"), true)
+        }
+        Err(e) => (format!("{title}: can't run sh: {e}"), true),
+    };
+    Message { text, error }
+}
+
+/// Trashes or deletes `paths`, for the log.
+fn remove(vfs: &dyn Vfs, paths: &[PathBuf], delete: bool) -> Message {
+    let n = paths.len();
+    let result = if delete {
+        paths
+            .iter()
+            .enumerate()
+            .try_for_each(|(i, p)| vfs.delete(p).map_err(|e| (i, e)))
+    } else {
+        vfs.trash(paths).map_err(|e| (0, e))
+    };
+    let (text, error) = match (result, delete) {
+        (Ok(()), false) => (format!("{n} moved to trash, restorable"), false),
+        (Ok(()), true) => (format!("{n} deleted for good"), false),
+        (Err((_, e)), false) => (format!("can't move to trash: {e}"), true),
+        (Err((i, e)), true) => (format!("deleted {i} of {n}, then: {e}"), true),
+    };
+    Message { text, error }
+}
+
+/// What to do about the usual first-connection failures. tosk can't answer
+/// prompts, so the fix happens in a terminal.
+fn connect_hint(error: &str, host: &Host) -> String {
+    let ssh = format!("ssh {}", host.ssh_args().join(" "));
+    if error.contains("Host key verification failed") {
+        format!("; run `{ssh}` once in a terminal to check and accept its key")
+    } else if error.contains("Permission denied") {
+        format!(
+            "; tosk logs in with keys or ssh-agent only, so `{ssh}` must work without a password"
+        )
+    } else {
+        String::new()
     }
 }
 
@@ -1008,6 +1542,7 @@ fn file_key(path: PathBuf, size: (u16, u16), line: Option<u64>) -> preview::Key 
         mtime,
         size,
         line,
+        host: None,
     }
 }
 
@@ -1379,6 +1914,12 @@ mod tests {
         fn delete(&self, path: &Path) -> io::Result<()> {
             Local.delete(path)
         }
+        fn read(&self, path: &Path, max: u64) -> io::Result<Vec<u8>> {
+            Local.read(path, max)
+        }
+        fn stat(&self, path: &Path) -> io::Result<crate::fs::Meta> {
+            Local.stat(path)
+        }
     }
 
     #[test]
@@ -1409,5 +1950,218 @@ mod tests {
         assert!(fs::symlink_metadata(bin.path().join("link-z")).is_ok());
         assert!(r.join("b/.z").exists(), "trashing a link keeps its target");
         assert!(app.selection.is_empty());
+    }
+
+    /// The names in the list, in order.
+    fn shown(app: &App) -> Vec<String> {
+        app.visible
+            .iter()
+            .map(|&i| app.entries[i].name.clone())
+            .collect()
+    }
+
+    /// Waits for a remote listing to arrive and be applied.
+    fn wait_listed(app: &mut App) {
+        for _ in 0..500 {
+            app.drain_workers();
+            if app.loading.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the listing never came");
+    }
+
+    #[test]
+    fn browses_a_server() {
+        let tmp = TempDir::new().unwrap();
+        let Some(sftp) = crate::fs::sftp::tests::fake(tmp.path()) else {
+            return;
+        };
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join("media/show")).unwrap();
+        fs::write(home.join("media/show/e01.mkv"), "x").unwrap();
+        fs::write(home.join("notes.md"), "hi").unwrap();
+        let local = tree();
+        let mut app = with_shortcuts(&local);
+        let host = sftp.host.clone();
+        app.connections.insert(host.clone(), Arc::new(sftp));
+
+        // The home folder, listed in the background.
+        app.go_host(host.clone(), None);
+        assert!(app.loading.is_some());
+        wait_listed(&mut app);
+        let real_home = home.canonicalize().unwrap();
+        assert_eq!(app.dir, real_home);
+        assert_eq!(app.host(), Some(&host));
+        assert_eq!(shown(&app), ["media", "notes.md"]);
+        assert_eq!(
+            app.display_path(&app.dir),
+            format!("ssh://me@nas{}", real_home.display())
+        );
+
+        // In and out, with the cursor remembered.
+        app.nav_enter();
+        wait_listed(&mut app);
+        assert_eq!(shown(&app), ["show"]);
+        app.nav_parent();
+        wait_listed(&mut app);
+        assert_eq!(name(&app), "media");
+
+        // New file, then rename it; both land after a background re-read.
+        app.start_create(false);
+        if let Some(Modal::Create { input, .. }) = &mut app.modal {
+            *input = TextInput::new("todo.txt");
+        }
+        app.apply_create();
+        wait_listed(&mut app);
+        assert!(home.join("todo.txt").exists());
+        assert_eq!(name(&app), "todo.txt");
+
+        // Trash refuses without gio; delete goes through after the confirm.
+        app.start_remove(false);
+        app.confirm_remove();
+        let mut got = None;
+        for _ in 0..500 {
+            app.drain_workers();
+            if let Some(m) = app.messages.front().filter(|m| m.error) {
+                got = Some(m.text.clone());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(got.unwrap().contains("has no gio"));
+        assert!(home.join("todo.txt").exists());
+        app.start_remove(true);
+        app.confirm_remove();
+        for _ in 0..500 {
+            app.drain_workers();
+            if !home.join("todo.txt").exists() && app.loading.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!home.join("todo.txt").exists());
+        wait_listed(&mut app);
+        assert!(!shown(&app).contains(&"todo.txt".to_string()));
+
+        // Local-only commands say so; properties work over ssh.
+        app.open_picker();
+        assert!(app.modal.is_none());
+        app.cursor = 0;
+        app.open_props();
+        assert!(matches!(app.modal, Some(Modal::Props(_))));
+        app.modal = None;
+
+        // Pin the folder under the cursor; it lights up once inside.
+        assert_eq!(name(&app), "media");
+        app.toggle_pin();
+        let pin = app.shortcuts.items.last().unwrap();
+        assert_eq!((pin.label.as_str(), pin.saved), ("me@nas:media", true));
+        assert_eq!(app.here(), None);
+        app.nav_enter();
+        wait_listed(&mut app);
+        assert_eq!(app.here(), Some(app.shortcuts.items.len() - 1));
+
+        // Back home: local again.
+        app.focus = Focus::Sidebar;
+        app.side_cursor = 0;
+        app.nav_enter();
+        assert!(app.remote.is_none());
+        assert_eq!(app.dir, root(&local));
+        assert!(app.vfs.exists(&app.dir.join("file.txt")));
+    }
+
+    #[test]
+    fn goto_reads_paths_and_addresses() {
+        let tmp = tree();
+        let mut app = App::new(root(&tmp), None, None).unwrap();
+        let goto = |app: &mut App, text: &str| {
+            app.start_goto();
+            if let Some(Modal::Goto(input)) = &mut app.modal {
+                *input = TextInput::new(text);
+            }
+            app.apply_goto();
+        };
+        goto(&mut app, "b");
+        assert_eq!(app.dir, root(&tmp).join("b"));
+        // A file: its folder, cursor on it.
+        goto(&mut app, &root(&tmp).join("file.txt").display().to_string());
+        assert_eq!(app.dir, root(&tmp));
+        assert_eq!(name(&app), "file.txt");
+        // An address starts connecting; a bad one is refused.
+        goto(&mut app, "-oProxyCommand=x:/");
+        assert!(app.loading.is_none());
+        assert!(app.messages.front().unwrap().error);
+        goto(&mut app, "ssh://nas/srv");
+        assert_eq!(app.loading.as_ref().unwrap().shown, "ssh://nas/srv");
+    }
+
+    /// Waits for a background job's message.
+    fn next_job_message(app: &mut App) -> Message {
+        for _ in 0..500 {
+            if let Ok(m) = app.jobs.1.try_recv() {
+                return m;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("no message from the job");
+    }
+
+    #[test]
+    fn custom_commands_run_with_placeholders() {
+        let tmp = tree();
+        let config = Config::parse(
+            r#"
+[commands.list]
+title = "List them"
+run = "printf '%s|' {selection} > {dir}/out.txt; printf %s {file} >> {dir}/out.txt"
+[commands.boom]
+title = "Boom"
+run = "echo first >&2; echo it broke >&2; exit 3"
+"#,
+        );
+        let mut app = App::with_config(root(&tmp), None, None, config).unwrap();
+        assert!(app.modal.is_none());
+        let index = |app: &App, id: &str| app.custom.iter().position(|c| c.id == id).unwrap();
+        select(&mut app, "b");
+        app.toggle_select();
+        select(&mut app, "file.txt");
+        app.toggle_select();
+        app.run_custom(index(&app, "list"));
+        let m = next_job_message(&mut app);
+        assert_eq!((m.text.as_str(), m.error), ("List them: done", false));
+        let r = root(&tmp);
+        let out = fs::read_to_string(r.join("out.txt")).unwrap();
+        let file = app.dir.join(&app.current().unwrap().file_name);
+        assert_eq!(
+            out,
+            format!(
+                "{}|{}|{}",
+                r.join("b").display(),
+                r.join("file.txt").display(),
+                file.display()
+            )
+        );
+        app.run_custom(index(&app, "boom"));
+        let m = next_job_message(&mut app);
+        assert_eq!((m.text.as_str(), m.error), ("Boom failed: it broke", true));
+    }
+
+    #[test]
+    fn config_problems_open_a_dialog() {
+        let tmp = tree();
+        let config = Config::parse(
+            "[keys]\nE = \"open.editr\"\nh = \"none\"\n[general]\nshow_hidden = true\n",
+        );
+        let app = App::with_config(root(&tmp), None, None, config).unwrap();
+        let Some(Modal::Notice { lines, .. }) = &app.modal else {
+            panic!("expected the problems dialog");
+        };
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("open.editr"));
+        // The rest of the config still applies.
+        assert!(app.show_hidden);
+        assert_eq!(app.keymap.first_key(Command::ViewHidden), None);
     }
 }

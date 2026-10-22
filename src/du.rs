@@ -8,6 +8,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::fs::Vfs;
+
 /// How often running totals are sent while counting.
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 
@@ -34,10 +36,19 @@ impl Du {
     /// Counts everything under `paths`. The paths themselves are followed if
     /// they're symlinks; what's inside folders isn't.
     pub fn spawn(paths: Vec<PathBuf>) -> Du {
+        Du::start(move |stop, tx| count(paths, stop, tx))
+    }
+
+    /// The same, through `vfs` (over ssh): one listing per folder.
+    pub fn spawn_in(vfs: Arc<dyn Vfs>, paths: Vec<PathBuf>) -> Du {
+        Du::start(move |stop, tx| count_in(&*vfs, paths, stop, tx))
+    }
+
+    fn start(work: impl FnOnce(&AtomicBool, &Sender<Totals>) + Send + 'static) -> Du {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
-        thread::spawn(move || count(paths, &stop, &tx));
+        thread::spawn(move || work(&stop, &tx));
         Du {
             rx,
             cancel,
@@ -111,6 +122,54 @@ fn count(paths: Vec<PathBuf>, stop: &AtomicBool, tx: &Sender<Totals>) {
     let _ = tx.send(t);
 }
 
+fn count_in(vfs: &dyn Vfs, paths: Vec<PathBuf>, stop: &AtomicBool, tx: &Sender<Totals>) {
+    let mut t = Totals::default();
+    let mut stack = Vec::new();
+    for path in paths {
+        match vfs.stat(&path) {
+            Ok(m) if m.entry.is_dir() => {
+                t.folders += 1;
+                stack.push(path);
+            }
+            Ok(m) => {
+                t.files += 1;
+                t.bytes += m.entry.size;
+            }
+            Err(_) => t.files += 1,
+        }
+    }
+    let mut last = Instant::now();
+    while let Some(dir) = stack.pop() {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(entries) = vfs.list(&dir) else {
+            t.unreadable += 1;
+            continue;
+        };
+        for e in entries {
+            if e.is_dir() && !e.is_link() {
+                t.folders += 1;
+                stack.push(dir.join(&e.file_name));
+            } else {
+                // Links count as themselves, not what they point at.
+                t.files += 1;
+                if !e.is_link() {
+                    t.bytes += e.size;
+                }
+            }
+        }
+        if last.elapsed() >= PROGRESS_EVERY {
+            if tx.send(t).is_err() {
+                return;
+            }
+            last = Instant::now();
+        }
+    }
+    t.done = true;
+    let _ = tx.send(t);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,7 +178,10 @@ mod tests {
     use tempfile::TempDir;
 
     fn finish(paths: Vec<PathBuf>) -> Totals {
-        let mut du = Du::spawn(paths);
+        wait(Du::spawn(paths))
+    }
+
+    fn wait(mut du: Du) -> Totals {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !du.totals.done {
             assert!(Instant::now() < deadline, "du didn't finish");
@@ -151,5 +213,11 @@ mod tests {
         symlink(r.join("big"), r.join("big-link")).unwrap();
         let t = finish(vec![r.join("big-link"), r.join("loose")]);
         assert_eq!((t.files, t.folders, t.bytes), (2, 1, 10_001));
+
+        // Through a backend, links are counted without their size.
+        let vfs: Arc<dyn Vfs> = Arc::new(crate::fs::local::Local);
+        let t = wait(Du::spawn_in(vfs, vec![r.join("top"), r.join("loose")]));
+        assert_eq!((t.files, t.folders, t.unreadable), (4, 3, 0));
+        assert_eq!(t.bytes, 9);
     }
 }

@@ -31,6 +31,7 @@ commands! {
     CursorDown => "cursor.down", "Move down";
     NavParent => "nav.parent", "Parent folder";
     NavEnter => "nav.enter", "Enter folder / follow link";
+    NavGoto => "nav.goto", "Go to a folder, or ssh://host/path";
     CursorTop => "cursor.top", "First item";
     CursorBottom => "cursor.bottom", "Last item";
     OpenDefault => "open.default", "Open with default app";
@@ -60,6 +61,32 @@ commands! {
     ViewSortReverse => "view.sort_reverse", "Reverse the sort order";
     HelpOpen => "help.open", "Shortcuts for this context";
     AppQuit => "app.quit", "Quit";
+}
+
+/// What a key runs: a built-in command, or one from `[commands.*]` in the
+/// config, by its index in `App::custom`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Action {
+    Builtin(Command),
+    Custom(usize),
+}
+
+impl From<Command> for Action {
+    fn from(c: Command) -> Action {
+        Action::Builtin(c)
+    }
+}
+
+/// Runs a built-in or custom command.
+pub fn run(app: &mut App, action: Action) {
+    match action {
+        Action::Builtin(cmd) => dispatch(app, cmd),
+        Action::Custom(_) if app.focus == Focus::Sidebar => {
+            let title = app.action_title(action);
+            app.info(format!("{title} works on the file list; Tab over first"));
+        }
+        Action::Custom(i) => app.run_custom(i),
+    }
 }
 
 impl Command {
@@ -95,6 +122,7 @@ pub fn dispatch(app: &mut App, cmd: Command) {
         CursorBottom => app.cursor_to_bottom(),
         NavParent => app.nav_parent(),
         NavEnter => app.nav_enter(),
+        NavGoto => app.start_goto(),
         FocusNext => app.cycle_focus(1),
         FocusPrev => app.cycle_focus(-1),
         ViewHidden => app.toggle_hidden(),

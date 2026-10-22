@@ -27,7 +27,12 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect) {
             }
         }
     }
-    header(buf, path_area, &app.display_path(&app.dir), focused);
+    // A remote folder on its way names itself; the old listing stays below.
+    let title = match &app.loading {
+        Some(l) => format!("{} · opening…", l.shown),
+        None => app.display_path(&app.dir),
+    };
+    header(buf, path_area, &title, focused);
     let body = body(area);
     if body.height == 0 {
         return;
@@ -139,10 +144,15 @@ pub(super) fn row(
     if selected {
         put(buf, r.x + 1, r.y, "●", 1, ink(MAUVE));
     }
-    let mut icon = [0; 4];
-    let icon = icons::for_entry(e).encode_utf8(&mut icon);
-    put(buf, r.x + 3, r.y, icon, 1, ink(color));
-    let name_x = r.x + 5;
+    // Without icons, the name takes their place.
+    let name_x = if app.icons {
+        let mut icon = [0; 4];
+        let icon = icons::for_entry(e).encode_utf8(&mut icon);
+        put(buf, r.x + 3, r.y, icon, 1, ink(color));
+        r.x + 5
+    } else {
+        r.x + 3
+    };
     let right = r.right().saturating_sub(1 + badge_w);
     let meta = meta(app, e);
     let meta_w = width(&meta);

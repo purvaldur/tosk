@@ -6,13 +6,16 @@ use std::fs::Metadata;
 use std::io::Read;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use jiff::tz::TimeZone;
 
 use crate::du::{Du, Totals};
 use crate::format::{count, exact_size, full_date, human_size, mode_string, owner, tilde};
+use crate::fs::Vfs;
+use crate::fs::sftp::Host;
 use crate::git;
-use crate::preview::classify;
+use crate::preview::{classify, kind_by_extension};
 
 /// Names listed under the fields when several items are selected.
 const MAX_NAMES: usize = 5;
@@ -50,8 +53,25 @@ impl Props {
     pub fn new(paths: &[PathBuf], home: Option<&Path>, tz: &TimeZone) -> Props {
         match paths {
             [one] => single(one, home, tz),
-            many => several(many, home),
+            many => {
+                let location = |p: &Path| tilde(p, home);
+                let du = Du::spawn(many.to_vec());
+                several(many, |p| p.is_dir(), location, du, None)
+            }
         }
+    }
+
+    /// The same over ssh: one round trip per item, and folder sizes
+    /// counted through `vfs`.
+    pub fn remote(vfs: Arc<dyn Vfs>, host: &Host, paths: &[PathBuf], tz: &TimeZone) -> Props {
+        let over = format!("{host} over ssh");
+        let location = |p: &Path| host.uri(Some(p));
+        if let [one] = paths {
+            return remote_single(vfs, host, one, tz);
+        }
+        let is_dir = |p: &Path| vfs.stat(p).is_ok_and(|m| m.entry.is_dir());
+        let du = Du::spawn_in(vfs.clone(), paths.to_vec());
+        several(paths, is_dir, location, du, Some(over))
     }
 
     /// Whether folder sizes are still being counted.
@@ -141,8 +161,82 @@ fn single(path: &Path, home: Option<&Path>, tz: &TimeZone) -> Props {
     }
 }
 
-fn several(paths: &[PathBuf], home: Option<&Path>) -> Props {
-    let folders = paths.iter().filter(|p| p.is_dir()).count();
+fn remote_single(vfs: Arc<dyn Vfs>, host: &Host, path: &Path, tz: &TimeZone) -> Props {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let mut fields = vec![("Name", Value::Text(name.clone()))];
+    let meta = match vfs.stat(path) {
+        Ok(m) => m,
+        Err(e) => {
+            fields.push(("Error", Value::Text(e.to_string())));
+            return Props {
+                title: name,
+                fields,
+                names: Vec::new(),
+                more: 0,
+                du: None,
+            };
+        }
+    };
+    let e = &meta.entry;
+    let kind = match &e.link_target {
+        Some(t) => {
+            let broken = if e.kind == crate::entry::Kind::Missing {
+                " (missing)"
+            } else {
+                ""
+            };
+            format!("Symbolic link → {}{broken}", t.display())
+        }
+        None if e.is_dir() => "Folder".to_string(),
+        // Telling text from binary would need a read; the name will do.
+        None => {
+            let label = kind_by_extension(&e.name).map_or("File", |k| k.label());
+            match path.extension() {
+                Some(ext) => format!("{label} (.{})", ext.to_string_lossy()),
+                None => label.to_string(),
+            }
+        }
+    };
+    fields.push(("Type", Value::Text(kind)));
+    let mut du = None;
+    if e.is_dir() {
+        fields.push(("Contents", Value::Contents));
+        du = Some(Du::spawn_in(vfs.clone(), vec![path.to_path_buf()]));
+    } else {
+        fields.push(("Size", Value::Text(exact_size(e.size))));
+    }
+    if let Some(parent) = path.parent() {
+        fields.push(("Location", Value::Text(host.uri(Some(parent)))));
+    }
+    fields.push(("Host", Value::Text(format!("{host} over ssh"))));
+    if let Some(t) = e.mtime {
+        fields.push(("Modified", Value::Text(full_date(t, tz))));
+    }
+    // Names for the ids would need the server's tables.
+    let perms = format!("{}  {}:{}", mode_string(meta.mode), meta.uid, meta.gid);
+    fields.push(("Permissions", Value::Text(perms)));
+    Props {
+        title: name,
+        fields,
+        names: Vec::new(),
+        more: 0,
+        du,
+    }
+}
+
+/// Several items. `is_dir` and `location` read the backend they're on;
+/// `host` adds a Host row for remote ones.
+fn several(
+    paths: &[PathBuf],
+    is_dir: impl Fn(&Path) -> bool,
+    location: impl Fn(&Path) -> String,
+    du: Du,
+    host: Option<String>,
+) -> Props {
+    let folders = paths.iter().filter(|p| is_dir(p)).count();
     let files = paths.len() - folders;
     let mut selected = Vec::new();
     if folders > 0 {
@@ -153,15 +247,18 @@ fn several(paths: &[PathBuf], home: Option<&Path>) -> Props {
     }
     let parents: BTreeSet<&Path> = paths.iter().filter_map(|p| p.parent()).collect();
     let location = match parents.iter().collect::<Vec<_>>().as_slice() {
-        [one] => tilde(one, home),
+        [one] => location(one),
         many => count(many.len(), "place", "places"),
     };
-    let fields = vec![
+    let mut fields = vec![
         ("Selected", Value::Text(selected.join(", "))),
         ("Total size", Value::TotalSize),
         ("Counted", Value::Counted),
         ("Location", Value::Text(location)),
     ];
+    if let Some(host) = host {
+        fields.push(("Host", Value::Text(host)));
+    }
     let names = paths
         .iter()
         .take(MAX_NAMES)
@@ -177,7 +274,7 @@ fn several(paths: &[PathBuf], home: Option<&Path>) -> Props {
         fields,
         names,
         more: paths.len().saturating_sub(MAX_NAMES),
-        du: Some(Du::spawn(paths.to_vec())),
+        du: Some(du),
     }
 }
 

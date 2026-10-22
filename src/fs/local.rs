@@ -3,7 +3,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::Vfs;
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
+
+use super::{Meta, Vfs};
 use crate::entry::{Entry, Kind};
 
 pub struct Local;
@@ -56,6 +59,24 @@ impl Vfs for Local {
         } else {
             fs::remove_file(path)
         }
+    }
+
+    fn read(&self, path: &Path, max: u64) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        fs::File::open(path)?.take(max).read_to_end(&mut out)?;
+        Ok(out)
+    }
+
+    fn stat(&self, path: &Path) -> io::Result<Meta> {
+        let lmeta = fs::symlink_metadata(path)?;
+        let m = fs::metadata(path).unwrap_or(lmeta);
+        let name = path.file_name().unwrap_or_default().to_os_string();
+        Ok(Meta {
+            entry: entry_for(path, name),
+            mode: m.mode(),
+            uid: m.uid(),
+            gid: m.gid(),
+        })
     }
 }
 

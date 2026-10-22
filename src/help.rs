@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::Read;
 
 use crate::app::{App, Focus};
+use crate::command::Action;
 use crate::command::Command::{self, *};
 use crate::preview::{FileKind, classify};
 use crate::text_input::TextInput;
@@ -18,7 +19,7 @@ pub struct HelpState {
 
 pub enum Row {
     Section(String),
-    Command(Command),
+    Command(Action),
 }
 
 /// The menu's rows for the current context, keeping only commands whose
@@ -26,14 +27,17 @@ pub enum Row {
 /// that lists it, and a section with nothing left is dropped.
 pub fn rows(app: &App, query: &str) -> Vec<Row> {
     let query = query.to_lowercase();
-    let mut seen: Vec<Command> = Vec::new();
+    let mut seen: Vec<Action> = Vec::new();
     let mut rows = Vec::new();
     for (title, cmds) in sections(app) {
-        let fresh: Vec<Command> = cmds.into_iter().filter(|c| !seen.contains(c)).collect();
+        let fresh: Vec<Action> = cmds.into_iter().filter(|c| !seen.contains(c)).collect();
         seen.extend(&fresh);
-        let shown: Vec<Command> = fresh
+        let shown: Vec<Action> = fresh
             .into_iter()
-            .filter(|c| c.title().to_lowercase().contains(&query) || c.id().contains(&query))
+            .filter(|&a| {
+                app.action_title(a).to_lowercase().contains(&query)
+                    || app.action_id(a).contains(&query)
+            })
             .collect();
         if !shown.is_empty() {
             rows.push(Row::Section(title));
@@ -43,7 +47,7 @@ pub fn rows(app: &App, query: &str) -> Vec<Row> {
     rows
 }
 
-pub fn commands(rows: &[Row]) -> Vec<Command> {
+pub fn commands(rows: &[Row]) -> Vec<Action> {
     rows.iter()
         .filter_map(|r| match r {
             Row::Command(c) => Some(*c),
@@ -52,18 +56,25 @@ pub fn commands(rows: &[Row]) -> Vec<Command> {
         .collect()
 }
 
-fn sections(app: &App) -> Vec<(String, Vec<Command>)> {
+fn sections(app: &App) -> Vec<(String, Vec<Action>)> {
+    let builtin =
+        |cmds: Vec<Command>| -> Vec<Action> { cmds.into_iter().map(Action::from).collect() };
     let mut out = Vec::new();
+    // The user's own commands, first while on files.
+    if app.focus == Focus::Files && !app.custom.is_empty() {
+        let all = (0..app.custom.len()).map(Action::Custom).collect();
+        out.push(("Your commands".to_string(), all));
+    }
     if app.focus == Focus::Sidebar {
         out.push((
             "Sidebar".to_string(),
-            vec![NavEnter, CursorUp, CursorDown, ShortcutPin],
+            builtin(vec![NavEnter, CursorUp, CursorDown, ShortcutPin]),
         ));
     }
     if app.selection.len() >= 2 {
         out.push((
             format!("Selection · {} items", app.selection.len()),
-            vec![
+            builtin(vec![
                 FileProps,
                 FileRename,
                 FileCopy,
@@ -72,7 +83,7 @@ fn sections(app: &App) -> Vec<(String, Vec<Command>)> {
                 FileDelete,
                 SelectToggle,
                 SelectClear,
-            ],
+            ]),
         ));
     }
     if app.focus == Focus::Files
@@ -104,7 +115,7 @@ fn sections(app: &App) -> Vec<(String, Vec<Command>)> {
             vec![OpenDefault, FileCopy, PathCopy, FileRename]
         };
         cmds.extend([FileProps, SelectToggle, FileTrash, FileDelete]);
-        out.push((format!("On {}", e.name), cmds));
+        out.push((format!("On {}", e.name), builtin(cmds)));
     }
     let folder = app
         .dir
@@ -113,7 +124,7 @@ fn sections(app: &App) -> Vec<(String, Vec<Command>)> {
         .unwrap_or_else(|| app.display_path(&app.dir));
     out.push((
         format!("In {folder}"),
-        vec![
+        builtin(vec![
             FileNew,
             FileNewFolder,
             PickerFiles,
@@ -127,11 +138,12 @@ fn sections(app: &App) -> Vec<(String, Vec<Command>)> {
             ViewSortReverse,
             ShortcutPin,
             NavParent,
-        ],
+            NavGoto,
+        ]),
     ));
     out.push((
         "Everywhere".to_string(),
-        vec![
+        builtin(vec![
             FocusNext,
             FocusPrev,
             HelpOpen,
@@ -141,7 +153,7 @@ fn sections(app: &App) -> Vec<(String, Vec<Command>)> {
             CursorTop,
             CursorBottom,
             SelectClear,
-        ],
+        ]),
     ));
     out
 }
@@ -168,6 +180,17 @@ mod tests {
         app
     }
 
+    /// The built-in commands listed, in order.
+    fn builtins(rows: &[Row]) -> Vec<Command> {
+        commands(rows)
+            .into_iter()
+            .filter_map(|a| match a {
+                Action::Builtin(c) => Some(c),
+                Action::Custom(_) => None,
+            })
+            .collect()
+    }
+
     fn titles(rows: &[Row]) -> Vec<String> {
         rows.iter()
             .filter_map(|r| match r {
@@ -192,14 +215,14 @@ mod tests {
         let app = app_on(&tmp, "build.sh");
         let rows = rows(&app, "");
         assert_eq!(titles(&rows)[0], "On build.sh");
-        assert_eq!(commands(&rows)[0], ScriptRun);
+        assert_eq!(builtins(&rows)[0], ScriptRun);
         assert_eq!(ScriptRun.title(), "Run script in terminal panel");
     }
 
     #[test]
     fn order_depends_on_kind() {
         let tmp = setup();
-        let first = |name: &str| commands(&rows(&app_on(&tmp, name), ""))[0];
+        let first = |name: &str| builtins(&rows(&app_on(&tmp, name), ""))[0];
         assert_eq!(first("notes.md"), OpenEditor);
         assert_eq!(first("blob"), OpenDefault);
         assert_eq!(first("src"), NavEnter);
@@ -214,7 +237,7 @@ mod tests {
         app.toggle_select();
         let rows = rows(&app, "");
         assert_eq!(titles(&rows)[0], "Selection · 2 items");
-        let cmds = commands(&rows);
+        let cmds = builtins(&rows);
         let mut unique = cmds.clone();
         unique.sort_by_key(|c| c.id());
         unique.dedup();
@@ -233,12 +256,35 @@ mod tests {
         let tmp = setup();
         let app = app_on(&tmp, "notes.md");
         let rows = rows(&app, "HIDDEN");
-        assert_eq!(commands(&rows), [ViewHidden]);
+        assert_eq!(builtins(&rows), [ViewHidden]);
         assert_eq!(
-            commands(&super::rows(&app, "picker.")),
+            builtins(&super::rows(&app, "picker.")),
             [PickerFiles, PickerGrep]
         );
         assert!(super::rows(&app, "zzz").is_empty());
+    }
+
+    #[test]
+    fn custom_commands_lead_with_their_keys() {
+        let tmp = setup();
+        let config = crate::config::Config::parse(
+            "[keys]\nE = \"open.editor\"\nW = \"wallpaper\"\n\
+             [commands.wallpaper]\ntitle = \"Set as wallpaper\"\nrun = \"true {file}\"\n",
+        );
+        let dir = tmp.path().canonicalize().unwrap();
+        let app = App::with_config(dir, None, None, config).unwrap();
+        let rows = rows(&app, "");
+        assert_eq!(titles(&rows)[0], "Your commands");
+        assert_eq!(commands(&rows)[0], Action::Custom(0));
+        assert_eq!(app.action_title(Action::Custom(0)), "Set as wallpaper");
+        let key = |a: Action| app.keymap.first_key(a).map(|k| k.to_string());
+        assert_eq!(key(Action::Custom(0)).as_deref(), Some("W"));
+        // The milestone's check: the menu shows E for Edit in Helix.
+        assert_eq!(key(Action::Builtin(OpenEditor)).as_deref(), Some("E"));
+        assert_eq!(
+            super::commands(&super::rows(&app, "wallp")),
+            [Action::Custom(0)]
+        );
     }
 
     #[test]

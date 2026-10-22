@@ -2,7 +2,7 @@ use crossterm::event::{KeyEvent, KeyEventKind};
 
 use crate::app::App;
 use crate::app::Focus;
-use crate::command::Command;
+use crate::command::{Action, Command};
 use crate::keymap::{Code, Key};
 use crate::modal::Modal;
 use crate::picker::Pick;
@@ -23,15 +23,15 @@ pub fn handle_key(app: &mut App, ev: KeyEvent) {
     } else if app.focus == Focus::Terminal {
         // Every key goes to the shell, except the ones that hide it.
         match app.keymap.lookup(key) {
-            Some(Command::TermToggle) => app.toggle_terminal(),
+            Some(Action::Builtin(Command::TermToggle)) => app.toggle_terminal(),
             _ => {
                 if let Some(t) = &mut app.terminal {
                     t.key(ev);
                 }
             }
         }
-    } else if let Some(cmd) = app.keymap.lookup(key) {
-        command::dispatch(app, cmd);
+    } else if let Some(action) = app.keymap.lookup(key) {
+        command::run(app, action);
     }
 }
 
@@ -72,6 +72,18 @@ fn modal_key(app: &mut App, key: Key) {
             Some(Modal::Search(s)) => Some(s.as_mut()),
             _ => None,
         }),
+        Some(Modal::Goto(input)) => match plain(key) {
+            Some(Code::Enter) => app.apply_goto(),
+            Some(Code::Esc) => app.modal = None,
+            _ => {
+                input.handle(key);
+            }
+        },
+        Some(Modal::Notice { .. }) => {
+            if let Some(Code::Esc | Code::Enter | Code::Char('q')) = plain(key) {
+                app.modal = None;
+            }
+        }
         Some(Modal::Props(_)) => {
             if let Some(Code::Esc | Code::Enter | Code::Char('p' | 'q')) = plain(key) {
                 app.modal = None;
@@ -141,9 +153,9 @@ fn help_key(app: &mut App, key: Key) {
         Some(Code::Char('/')) => h.typing = true,
         _ => run = app.keymap.lookup(key).filter(|c| commands.contains(c)),
     }
-    if let Some(cmd) = run {
+    if let Some(action) = run {
         app.modal = None;
-        command::dispatch(app, cmd);
+        command::run(app, action);
     }
 }
 

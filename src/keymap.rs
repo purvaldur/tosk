@@ -3,7 +3,8 @@ use std::fmt;
 use anyhow::{Result, bail};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::command::Command;
+use crate::command::{Action, Command};
+use crate::config::Custom;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Code {
@@ -191,6 +192,7 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("f", "picker.files"),
     ("F", "picker.grep"),
     ("C-f", "filter.start"),
+    ("C-l", "nav.goto"),
     ("C-s", "term.toggle"),
     ("Tab", "focus.next"),
     ("S-Tab", "focus.prev"),
@@ -206,7 +208,8 @@ const DEFAULTS: &[(&str, &str)] = &[
 ];
 
 pub struct Keymap {
-    bindings: Vec<(Key, Command)>,
+    /// Searched front to back; overrides from the config go first.
+    bindings: Vec<(Key, Action)>,
 }
 
 impl Keymap {
@@ -215,21 +218,57 @@ impl Keymap {
             .iter()
             .map(|&(key, id)| {
                 let key = Key::parse(key).expect("default key parses");
-                (key, Command::from_id(id).expect("default command exists"))
+                let cmd = Command::from_id(id).expect("default command exists");
+                (key, Action::Builtin(cmd))
             })
             .collect();
         Keymap { bindings }
     }
 
-    /// The key shown for `cmd` in menus: its first binding.
-    pub fn first_key(&self, cmd: Command) -> Option<Key> {
+    /// Applies `[keys]`: each key is bound to a command id, a custom
+    /// command's id, or `none` to unbind it. Returns what couldn't be used.
+    pub fn configure(&mut self, keys: &[(String, String)], custom: &[Custom]) -> Vec<String> {
+        let mut problems = Vec::new();
+        // Read in reverse, so the first one listed ends up in front.
+        for (name, target) in keys.iter().rev() {
+            let key = match Key::parse(name) {
+                Ok(k) => k,
+                Err(e) => {
+                    problems.push(format!("[keys] {e}"));
+                    continue;
+                }
+            };
+            let action = if target == "none" {
+                None
+            } else if let Some(cmd) = Command::from_id(target) {
+                Some(Action::Builtin(cmd))
+            } else if let Some(i) = custom.iter().position(|c| c.id == *target) {
+                Some(Action::Custom(i))
+            } else {
+                problems.push(format!(
+                    "[keys] “{name}”: there's no command “{target}”; ? lists the ids with /"
+                ));
+                continue;
+            };
+            self.bindings.retain(|&(k, _)| k != key);
+            if let Some(action) = action {
+                self.bindings.insert(0, (key, action));
+            }
+        }
+        problems.reverse();
+        problems
+    }
+
+    /// The key shown for an action in menus: its first binding.
+    pub fn first_key(&self, action: impl Into<Action>) -> Option<Key> {
+        let action = action.into();
         self.bindings
             .iter()
-            .find(|&&(_, c)| c == cmd)
+            .find(|&&(_, a)| a == action)
             .map(|&(k, _)| k)
     }
 
-    pub fn lookup(&self, key: Key) -> Option<Command> {
+    pub fn lookup(&self, key: Key) -> Option<Action> {
         self.bindings
             .iter()
             .find(|(k, _)| *k == key)
@@ -363,7 +402,10 @@ mod tests {
     #[test]
     fn defaults_cover_the_spec_table() {
         let km = Keymap::defaults();
-        let look = |s: &str| km.lookup(Key::parse(s).unwrap()).map(Command::id);
+        let look = |s: &str| match km.lookup(Key::parse(s).unwrap()) {
+            Some(Action::Builtin(c)) => Some(c.id()),
+            _ => None,
+        };
         assert_eq!(look("i"), Some("cursor.up"));
         assert_eq!(look("j"), Some("nav.parent"));
         assert_eq!(look("l"), Some("nav.enter"));
@@ -378,10 +420,50 @@ mod tests {
         // Every command has at least one default key.
         for &c in Command::ALL {
             assert!(
-                km.bindings.iter().any(|&(_, b)| b == c),
+                km.bindings.iter().any(|&(_, b)| b == Action::Builtin(c)),
                 "{} unbound",
                 c.id()
             );
         }
+    }
+
+    #[test]
+    fn config_overrides_keys() {
+        let custom = [Custom {
+            id: "wallpaper".into(),
+            title: "Set as wallpaper".into(),
+            run: "x".into(),
+            place: crate::config::Where::Background,
+        }];
+        let keys: Vec<(String, String)> = [
+            ("E", "open.editor"),
+            ("W", "wallpaper"),
+            ("q", "none"),
+            ("X-q", "app.quit"),
+            ("Z", "nope"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let mut km = Keymap::defaults();
+        let problems = km.configure(&keys, &custom);
+        let key = |s: &str| Key::parse(s).unwrap();
+        // The milestone's check: E edits, and menus show E for it.
+        assert_eq!(
+            km.lookup(key("E")),
+            Some(Action::Builtin(Command::OpenEditor))
+        );
+        assert_eq!(km.first_key(Command::OpenEditor), Some(key("E")));
+        // The old key still works unless it's unbound.
+        assert_eq!(
+            km.lookup(key("e")),
+            Some(Action::Builtin(Command::OpenEditor))
+        );
+        assert_eq!(km.lookup(key("W")), Some(Action::Custom(0)));
+        assert_eq!(km.first_key(Action::Custom(0)), Some(key("W")));
+        assert_eq!(km.lookup(key("q")), None);
+        assert_eq!(problems.len(), 2);
+        assert!(problems[0].contains("X-q"), "{problems:?}");
+        assert!(problems[1].contains("no command “nope”"), "{problems:?}");
     }
 }

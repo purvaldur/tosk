@@ -1,6 +1,7 @@
 mod app;
 mod clipboard;
 mod command;
+mod config;
 mod counts;
 mod du;
 mod entry;
@@ -45,6 +46,7 @@ use ratatui::layout::Rect;
 use ratatui_image::picker::{Picker, ProtocolType};
 
 use crate::app::App;
+use crate::config::Config;
 
 const TICK: Duration = Duration::from_millis(50);
 
@@ -57,8 +59,12 @@ fn main() -> Result<()> {
     }));
 
     let result = init().and_then(|mut terminal| {
-        let pins = dirs::config_dir().map(|d| d.join("tosk/shortcuts"));
-        let mut app = App::new(dir, kitty_graphics(), pins)?;
+        let config_dir = dirs::config_dir().map(|d| d.join("tosk"));
+        let pins = config_dir.as_ref().map(|d| d.join("shortcuts"));
+        let config = config_dir
+            .map(|d| Config::load(&d.join("config.toml")))
+            .unwrap_or_default();
+        let mut app = App::with_config(dir, kitty_graphics(), pins, config)?;
         run(&mut terminal, &mut app)
     });
     restore();

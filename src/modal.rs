@@ -25,7 +25,14 @@ pub enum Modal {
         folder: bool,
         input: TextInput,
     },
+    /// `Ctrl-l`: a path or `ssh://` address to go to.
+    Goto(TextInput),
     Help(HelpState),
+    /// Something to read, like problems in the config; Esc closes it.
+    Notice {
+        title: String,
+        lines: Vec<String>,
+    },
     Picker(Box<FilePicker>),
     Search(Box<ContentSearch>),
     /// `p`, with folder sizes counting in the background.

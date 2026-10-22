@@ -23,6 +23,7 @@ use syntect::util::LinesWithEndings;
 
 use crate::entry::Entry;
 use crate::fs::Vfs;
+use crate::fs::sftp::Host;
 use crate::sort::{Sort, sort_entries};
 use crate::tool::{self, ToolError};
 
@@ -40,6 +41,8 @@ const CACHE_LIMIT: usize = 64;
 /// file, reading tags shouldn't.
 const RENDER_TIMEOUT: Duration = Duration::from_secs(8);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+/// Remote images up to this size are fetched whole to be shown.
+const REMOTE_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
 
 const THEME: &[u8] = include_bytes!("../assets/catppuccin-mocha.tmTheme");
 
@@ -52,6 +55,8 @@ pub struct Key {
     pub size: (u16, u16),
     /// Show text around this 1-based line instead of from the top.
     pub line: Option<u64>,
+    /// The server `path` is on; `None` here.
+    pub host: Option<Host>,
 }
 
 pub enum Content {
@@ -144,24 +149,25 @@ pub fn kind_by_extension(name: &str) -> Option<FileKind> {
 }
 
 pub struct Previewer {
-    requests: Sender<Key>,
+    requests: Sender<(Key, Arc<dyn Vfs>)>,
     results: Receiver<(Key, Content)>,
     cache: HashMap<Key, Content>,
     pending: Option<Key>,
 }
 
 impl Previewer {
-    pub fn spawn(vfs: Arc<dyn Vfs>, picker: Option<Picker>) -> Previewer {
-        let (requests, request_rx) = mpsc::channel::<Key>();
+    pub fn spawn(picker: Option<Picker>) -> Previewer {
+        let (requests, request_rx) = mpsc::channel::<(Key, Arc<dyn Vfs>)>();
         let (result_tx, results) = mpsc::channel();
         thread::spawn(move || {
-            let mut builder = Builder::new(vfs, picker);
-            while let Ok(mut key) = request_rx.recv() {
+            let mut builder = Builder::new(picker);
+            while let Ok(mut req) = request_rx.recv() {
                 // Only the newest request matters when the cursor moves fast.
                 while let Ok(newer) = request_rx.try_recv() {
-                    key = newer;
+                    req = newer;
                 }
-                let content = builder.build(&key);
+                let (key, vfs) = req;
+                let content = builder.build(&key, &*vfs);
                 if result_tx.send((key, content)).is_err() {
                     break;
                 }
@@ -175,13 +181,14 @@ impl Previewer {
         }
     }
 
-    /// Ask for a preview unless it's cached or already on its way.
-    pub fn want(&mut self, key: &Key) {
+    /// Ask for a preview, read through `vfs`, unless it's cached or
+    /// already on its way.
+    pub fn want(&mut self, key: &Key, vfs: Arc<dyn Vfs>) {
         if self.cache.contains_key(key) || self.pending.as_ref() == Some(key) {
             return;
         }
         self.pending = Some(key.clone());
-        let _ = self.requests.send(key.clone());
+        let _ = self.requests.send((key.clone(), vfs));
     }
 
     pub fn get(&self, key: &Key) -> Option<&Content> {
@@ -206,28 +213,29 @@ impl Previewer {
 }
 
 struct Builder {
-    vfs: Arc<dyn Vfs>,
     picker: Option<Picker>,
     /// Loaded on the first text preview.
     syntax: Option<(SyntaxSet, Theme)>,
 }
 
 impl Builder {
-    fn new(vfs: Arc<dyn Vfs>, picker: Option<Picker>) -> Builder {
+    fn new(picker: Option<Picker>) -> Builder {
         Builder {
-            vfs,
             picker,
             syntax: None,
         }
     }
 
-    fn build(&mut self, key: &Key) -> Content {
+    fn build(&mut self, key: &Key, vfs: &dyn Vfs) -> Content {
+        if key.host.is_some() {
+            return self.remote(key, vfs);
+        }
         let meta = match std::fs::metadata(&key.path) {
             Ok(m) => m,
             Err(e) => return Content::Error(e.to_string()),
         };
         if meta.is_dir() {
-            return self.folder(&key.path);
+            return folder(vfs, &key.path, true);
         }
         let noted = |kind: FileKind, note: String| Content::Info {
             label: kind.label(),
@@ -354,16 +362,54 @@ impl Builder {
         }
     }
 
-    fn folder(&self, path: &Path) -> Content {
-        let mut entries = match self.vfs.list(path) {
-            Ok(v) => v,
+    /// Over ssh: folders, text from the first 64 KB, and images small
+    /// enough to fetch. Other kinds would need the whole file here.
+    fn remote(&mut self, key: &Key, vfs: &dyn Vfs) -> Content {
+        let meta = match vfs.stat(&key.path) {
+            Ok(m) => m,
             Err(e) => return Content::Error(e.to_string()),
         };
-        sort_entries(&mut entries, Sort::default());
-        for e in entries.iter_mut().filter(|e| e.is_dir()).take(MAX_COUNTED) {
-            e.children = self.vfs.count_children(&path.join(&e.file_name)).ok();
+        let e = meta.entry;
+        if e.is_dir() {
+            // Counting every subfolder would cost a round trip each.
+            return folder(vfs, &key.path, false);
         }
-        Content::Folder(entries)
+        let noted = |kind: FileKind, note: &str| Content::Info {
+            label: kind.label(),
+            size: e.size,
+            mtime: e.mtime,
+            note: note.to_string(),
+        };
+        let head = match vfs.read(&key.path, TEXT_BYTES) {
+            Ok(h) => h,
+            Err(err) => return Content::Error(err.to_string()),
+        };
+        match classify(&key.path, &head) {
+            FileKind::Text => self.text(key, &head),
+            FileKind::Image => match &self.picker {
+                Some(_) if e.size > REMOTE_IMAGE_BYTES => {
+                    noted(FileKind::Image, "too big to preview over ssh")
+                }
+                Some(picker) => {
+                    let whole = if e.size <= TEXT_BYTES {
+                        Ok(head)
+                    } else {
+                        vfs.read(&key.path, REMOTE_IMAGE_BYTES)
+                    };
+                    let (w, h) = key.size;
+                    match whole
+                        .map_err(|err| ToolError::Failed(err.to_string()))
+                        .and_then(|bytes| protocol_from_png(picker, &bytes, Size::new(w, h)))
+                    {
+                        Ok(p) => Content::Image(p),
+                        Err(err) => Content::Error(err.message()),
+                    }
+                }
+                None => noted(FileKind::Image, "no previewer"),
+            },
+            FileKind::Binary => noted(FileKind::Binary, "no previewer"),
+            kind => noted(kind, "no preview over ssh"),
+        }
     }
 
     /// From the top, or around `key.line` with it a third of the way down.
@@ -433,6 +479,22 @@ impl Builder {
             })
             .collect()
     }
+}
+
+/// A folder's entries, sorted, with item counts for its subfolders when
+/// `counted`.
+fn folder(vfs: &dyn Vfs, path: &Path, counted: bool) -> Content {
+    let mut entries = match vfs.list(path) {
+        Ok(v) => v,
+        Err(e) => return Content::Error(e.to_string()),
+    };
+    sort_entries(&mut entries, Sort::default());
+    if counted {
+        for e in entries.iter_mut().filter(|e| e.is_dir()).take(MAX_COUNTED) {
+            e.children = vfs.count_children(&path.join(&e.file_name)).ok();
+        }
+    }
+    Content::Folder(entries)
 }
 
 /// `rows` lines starting at 1-based line `first`, as bytes.
@@ -676,11 +738,21 @@ mod tests {
             mtime: None,
             size: (40, 10),
             line: None,
+            host: None,
         }
     }
 
-    fn builder(picker: Option<Picker>) -> Builder {
-        Builder::new(Arc::new(Local), picker)
+    /// Builds through the local backend.
+    struct Local1(Builder);
+
+    impl Local1 {
+        fn build(&mut self, key: &Key) -> Content {
+            self.0.build(key, &Local)
+        }
+    }
+
+    fn builder(picker: Option<Picker>) -> Local1 {
+        Local1(Builder::new(picker))
     }
 
     fn text_of(line: &Line) -> String {
@@ -780,9 +852,9 @@ mod tests {
     fn worker_answers_the_newest_request() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("a"), "a").unwrap();
-        let mut p = Previewer::spawn(Arc::new(Local), None);
+        let mut p = Previewer::spawn(None);
         let k = key(tmp.path().join("a"));
-        p.want(&k);
+        p.want(&k, Arc::new(Local));
         for _ in 0..200 {
             if p.drain() {
                 break;
@@ -947,6 +1019,40 @@ mod tests {
             panic!("expected media");
         };
         assert!(image.is_none());
+    }
+
+    #[test]
+    fn remote_previews() {
+        let tmp = TempDir::new().unwrap();
+        let Some(sftp) = crate::fs::sftp::tests::fake(tmp.path()) else {
+            return;
+        };
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join("dir/sub")).unwrap();
+        fs::write(home.join("dir/notes.md"), "# Hi\nthere\n").unwrap();
+        fs::write(home.join("clip.mp4"), "not really").unwrap();
+        let host = Some(sftp.host.clone());
+        let mut b = Builder::new(None);
+        let remote = |path: PathBuf| Key {
+            host: host.clone(),
+            ..key(path)
+        };
+        let Content::Text { lines, .. } = b.build(&remote(home.join("dir/notes.md")), &sftp) else {
+            panic!("expected text");
+        };
+        assert_eq!(text_of(&lines[1]), "there");
+        let Content::Folder(entries) = b.build(&remote(home.join("dir")), &sftp) else {
+            panic!("expected a folder");
+        };
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["sub", "notes.md"]);
+        // No subfolder counts over ssh: a round trip each.
+        assert_eq!(entries[0].children, None);
+        let Content::Info { label, note, .. } = b.build(&remote(home.join("clip.mp4")), &sftp)
+        else {
+            panic!("expected info");
+        };
+        assert_eq!((label, note.as_str()), ("Video", "no preview over ssh"));
     }
 
     #[test]

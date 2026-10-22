@@ -106,19 +106,32 @@ impl Kitty {
             Some(n) => format!("{}:{n}", p.display()).into(),
             None => p.clone().into(),
         }));
-        self.launch(cwd, &argv).map(|()| Opened::NewTab)
+        self.launch(Some(cwd), &argv).map(|()| Opened::NewTab)
     }
 
     /// `hx .` in `dir`, in a new tab.
     pub fn edit_folder(&self, dir: &Path) -> Result<(), String> {
-        self.launch(dir, &[self.helix.clone().into(), ".".into()])
+        self.launch(Some(dir), &[self.helix.clone().into(), ".".into()])
     }
 
-    fn launch(&self, cwd: &Path, argv: &[OsString]) -> Result<(), String> {
+    /// `kitten ssh <host> <script>` in a new tab: Helix on the server. The
+    /// tab isn't marked as the editor, so local files never go to it.
+    pub fn launch_ssh(&self, host_args: &[String], script: &str) -> Result<(), String> {
+        let mut argv: Vec<OsString> = vec!["kitten".into(), "ssh".into()];
+        argv.extend(host_args.iter().map(OsString::from));
+        argv.push(script.into());
+        self.launch(None, &argv)
+    }
+
+    /// A new tab running `argv`; with `cwd`, it's the editor tab there.
+    fn launch(&self, cwd: Option<&Path>, argv: &[OsString]) -> Result<(), String> {
         let socket = self.sockets.first().ok_or("no kitty socket")?;
-        let role = format!("role={}", self.role);
-        let mut cmd = self.command(socket, &["launch", "--type=tab", "--var", &role, "--cwd"]);
-        cmd.arg(cwd).args(argv);
+        let mut cmd = self.command(socket, &["launch", "--type=tab"]);
+        if let Some(cwd) = cwd {
+            cmd.args(["--var", &format!("role={}", self.role), "--cwd"])
+                .arg(cwd);
+        }
+        cmd.args(argv);
         let out = cmd.output().map_err(|e| format!("can't run kitty: {e}"))?;
         if out.status.success() {
             Ok(())
@@ -316,5 +329,11 @@ mod tests {
         assert!(
             logged.contains("launch --type=tab --var role=helix --cwd /p/src /usr/bin/helix .")
         );
+
+        fs::remove_file(&log).unwrap();
+        let host = ["-p".to_string(), "22".to_string(), "me@nas".to_string()];
+        k.launch_ssh(&host, "hx '/srv/a b.md'").unwrap();
+        let logged = fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("launch --type=tab kitten ssh -p 22 me@nas hx '/srv/a b.md'"));
     }
 }

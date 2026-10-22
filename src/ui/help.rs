@@ -135,7 +135,7 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect, h: &HelpState) {
                     buf,
                     title_x,
                     r.y,
-                    cmd.title(),
+                    &app.action_title(*cmd),
                     r.width.saturating_sub(KEY_WIDTH),
                     Style::default().fg(title_fg),
                 );

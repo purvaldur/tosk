@@ -79,11 +79,71 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect) {
                 input_line(buf, inner.x, inner.y, inner.width, input, style);
             }
         }
+        Some(Modal::Goto(input)) => {
+            let here = app.display_path(&app.dir);
+            let inner = frame(
+                buf,
+                area,
+                60,
+                1,
+                POPUP_BORDER,
+                ("Go to", &here),
+                "Enter go · Esc cancel · a path, ~, or ssh://[user@]host[:port]/path",
+            );
+            if inner.height > 0 {
+                let style = Style::default().fg(TEXT);
+                input_line(buf, inner.x, inner.y, inner.width, input, style);
+                if input.text.is_empty() {
+                    let hint = "e.g. ~/Videos or nas:/srv/media";
+                    let w = inner.width.saturating_sub(2);
+                    put(
+                        buf,
+                        inner.x + 2,
+                        inner.y,
+                        hint,
+                        w,
+                        Style::default().fg(POPUP_DIM),
+                    );
+                }
+            }
+        }
         Some(Modal::Help(h)) => super::help::render(app, buf, area, h),
+        Some(Modal::Notice { title, lines }) => notice(buf, area, title, lines),
         Some(Modal::Picker(p)) => super::picker::render(app, buf, area, p),
         Some(Modal::Search(s)) => super::picker::render_search(app, buf, area, s),
         Some(Modal::Props(p)) => super::props::render(buf, area, p),
         None => {}
+    }
+}
+
+/// Lines to read, word-wrapped to the box, e.g. problems in the config.
+fn notice(buf: &mut Buffer, area: Rect, title: &str, lines: &[String]) {
+    let w = 76.min(area.width.saturating_sub(10)).max(20);
+    let mut rows: Vec<String> = Vec::new();
+    for line in lines {
+        let mut cur = "•".to_string();
+        for word in line.split(' ') {
+            if width(&cur) + 1 + width(word) > w && width(&cur) > 2 {
+                rows.push(std::mem::replace(&mut cur, " ".to_string()));
+            }
+            cur.push(' ');
+            cur.push_str(word);
+        }
+        rows.push(cur);
+    }
+    let right = count(lines.len(), "problem", "problems");
+    let inner = frame(
+        buf,
+        area,
+        w,
+        rows.len() as u16,
+        RED,
+        (title, &right),
+        "Esc close · everything else in the config is in use",
+    );
+    for (i, row) in rows.iter().enumerate().take(inner.height as usize) {
+        let style = Style::default().fg(TEXT);
+        put(buf, inner.x, inner.y + i as u16, row, inner.width, style);
     }
 }
 
