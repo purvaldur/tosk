@@ -264,7 +264,9 @@ The tests never touch your own files, clipboard, kitty or config:
 - SFTP is tested against the system's `/usr/lib/ssh/sftp-server` when
   it's installed.
 
-## Credits
+## License
+
+MIT; see `LICENSE`.
 
 The syntax theme is [Catppuccin Mocha for bat](https://github.com/catppuccin/bat),
 MIT licensed; see `assets/LICENSE`.
