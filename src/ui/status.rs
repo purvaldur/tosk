@@ -5,12 +5,16 @@ use ratatui::style::{Modifier, Style};
 use super::{input_line, put, width};
 use crate::app::{App, Focus};
 use crate::format::count;
+use crate::sort::Sort;
 use crate::theme::*;
 
 pub fn render(app: &App, buf: &mut Buffer, area: Rect) {
     buf.set_style(area, Style::default().bg(MANTLE));
 
     let mut right = vec![count(app.visible.len(), "item", "items")];
+    if app.sort != Sort::default() {
+        right.push(format!("by {}", app.sort.label()));
+    }
     if app.show_hidden {
         right.push("hidden shown".to_string());
     }
@@ -49,14 +53,15 @@ pub fn render(app: &App, buf: &mut Buffer, area: Rect) {
         return;
     }
 
-    let mode = match app.focus {
-        Focus::Files => " FILES ",
-        Focus::Sidebar => " SHORTCUTS ",
+    let (mode, chip_bg) = match app.focus {
+        Focus::Files => (" FILES ", ACCENT),
+        Focus::Sidebar => (" SHORTCUTS ", ACCENT),
+        Focus::Terminal => (" TERMINAL ", GREEN),
     };
     let mut x = area.x;
     let mut room = room;
     for (text, style) in [
-        (mode.to_string(), chip(ACCENT)),
+        (mode.to_string(), chip(chip_bg)),
         (app.display_path(&app.dir), Style::default().fg(TEXT)),
         (
             app.current().map(|e| e.name.clone()).unwrap_or_default(),

@@ -38,6 +38,18 @@ impl Vfs for Local {
         trash::delete_all(paths).map_err(|e| io::Error::other(e.to_string()))
     }
 
+    fn create_file(&self, path: &Path) -> io::Result<()> {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map(drop)
+    }
+
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        fs::create_dir(path)
+    }
+
     fn delete(&self, path: &Path) -> io::Result<()> {
         if fs::symlink_metadata(path)?.is_dir() {
             fs::remove_dir_all(path)
@@ -140,6 +152,19 @@ mod tests {
         Local.delete(&r.join("file")).unwrap();
         assert!(!Local.exists(&r.join("tree")) && !Local.exists(&r.join("file")));
         assert!(Local.delete(&r.join("gone")).is_err());
+    }
+
+    #[test]
+    fn creates_files_and_folders_without_overwriting() {
+        let tmp = TempDir::new().unwrap();
+        let r = tmp.path();
+        fs::write(r.join("taken"), "keep me").unwrap();
+        Local.create_file(&r.join("new.txt")).unwrap();
+        Local.create_dir(&r.join("dir")).unwrap();
+        assert!(r.join("new.txt").is_file() && r.join("dir").is_dir());
+        assert!(Local.create_file(&r.join("taken")).is_err());
+        assert!(Local.create_dir(&r.join("taken")).is_err());
+        assert_eq!(fs::read_to_string(r.join("taken")).unwrap(), "keep me");
     }
 
     #[test]

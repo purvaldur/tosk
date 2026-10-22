@@ -20,6 +20,9 @@ pub trait Vfs: Send + Sync {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
     /// Moves to the freedesktop trash, restorable from any file manager.
     fn trash(&self, paths: &[PathBuf]) -> io::Result<()>;
+    /// Creates an empty file; fails if anything is already there.
+    fn create_file(&self, path: &Path) -> io::Result<()>;
+    fn create_dir(&self, path: &Path) -> io::Result<()>;
     /// Removes for good. Symlinks are removed, never followed.
     fn delete(&self, path: &Path) -> io::Result<()>;
 }

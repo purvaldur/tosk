@@ -1,33 +1,50 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use jiff::Zoned;
 use jiff::tz::TimeZone;
 use ratatui_image::picker::Picker;
 
+use crate::command::Command;
 use crate::counts::{Counted, Counter};
 use crate::entry::{Entry, Kind};
 use crate::format::{count, selection_summary, tilde};
 use crate::fs::Vfs;
 use crate::fs::local::Local;
+use crate::git::{GitStatus, GitWatcher};
+use crate::grep::ContentSearch;
+use crate::help::HelpState;
 use crate::keymap::Keymap;
-use crate::preview::{self, Previewer};
+use crate::kitty::{Kitty, Opened};
 use crate::modal::Modal;
+use crate::picker::FilePicker;
+use crate::preview::{self, FileKind, Previewer, classify};
+use crate::props::Props;
 use crate::rename;
 use crate::shortcuts::{Pin, Shortcuts};
+use crate::sort::{Sort, sort_entries};
+use crate::term_panel::TermPanel;
 use crate::text_input::TextInput;
-use crate::sort::sort_entries;
 use crate::{clipboard, launch};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
     Sidebar,
     Files,
+    /// The terminal panel; keys go to the shell. Not in the `Tab` cycle.
+    Terminal,
 }
+
+/// How often the git segment is refreshed while nothing else asks.
+const GIT_REFRESH: Duration = Duration::from_secs(5);
 
 /// What `Tab` and `S-Tab` cycle through. The terminal (milestone 6) stays
 /// out of it on purpose.
@@ -57,8 +74,20 @@ pub struct App {
     /// The filter is being typed.
     pub filtering: bool,
     pub modal: Option<Modal>,
+    /// The shell, started on first use and kept while the panel is hidden.
+    pub terminal: Option<TermPanel>,
+    pub terminal_open: bool,
+    /// Where focus goes back to when the terminal hides.
+    focus_before_terminal: Focus,
+    /// What the panel runs: `$SHELL`, or `/bin/sh`.
+    pub shell: std::ffi::OsString,
+    /// The panel's last known size in cells, (rows, cols).
+    terminal_size: (u16, u16),
     pub show_hidden: bool,
+    pub sort: Sort,
     pub preview: bool,
+    /// The two-line message area at the bottom; `L` hides it.
+    pub show_log: bool,
     /// What the preview pane should show, set before each draw.
     pub preview_key: Option<preview::Key>,
     pub previewer: Previewer,
@@ -72,7 +101,15 @@ pub struct App {
     /// Name under the cursor, per folder, for the session.
     remembered: HashMap<PathBuf, OsString>,
     counter: Counter,
-    vfs: Arc<dyn Vfs>,
+    /// The work tree `dir` is in, for the segment and the file marks;
+    /// `None` outside one.
+    pub git: Option<GitStatus>,
+    git_watch: GitWatcher,
+    /// When git was last asked, for the periodic refresh.
+    git_asked: Instant,
+    /// Results of fire-and-forget jobs (kitty calls), as log messages.
+    jobs: (Sender<Message>, Receiver<Message>),
+    pub(crate) vfs: Arc<dyn Vfs>,
 }
 
 impl App {
@@ -94,8 +131,15 @@ impl App {
             filter: TextInput::default(),
             filtering: false,
             modal: None,
+            terminal: None,
+            terminal_open: false,
+            focus_before_terminal: Focus::Files,
+            shell: std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()),
+            terminal_size: (6, 80),
             show_hidden: false,
+            sort: Sort::default(),
             preview: true,
+            show_log: true,
             preview_key: None,
             previewer: Previewer::spawn(vfs.clone(), picker),
             messages: VecDeque::new(),
@@ -106,6 +150,10 @@ impl App {
             this_year: now.year(),
             remembered: HashMap::new(),
             counter: Counter::spawn(vfs.clone()),
+            git: None,
+            git_watch: GitWatcher::spawn(),
+            git_asked: Instant::now(),
+            jobs: mpsc::channel(),
             vfs,
         };
         app.load(dir.clone(), None)
@@ -159,7 +207,69 @@ impl App {
     fn focused_list(&mut self) -> (&mut usize, usize) {
         match self.focus {
             Focus::Sidebar => (&mut self.side_cursor, self.shortcuts.items.len()),
-            Focus::Files => (&mut self.cursor, self.visible.len()),
+            Focus::Files | Focus::Terminal => (&mut self.cursor, self.visible.len()),
+        }
+    }
+
+    /// `Ctrl-s`: hidden → show and focus; shown → focus; focused → hide and
+    /// give focus back.
+    pub fn toggle_terminal(&mut self) {
+        if self.focus == Focus::Terminal {
+            self.terminal_open = false;
+            self.focus = self.focus_before_terminal;
+        } else {
+            self.focus_terminal();
+        }
+    }
+
+    /// Shows and focuses the panel, starting the shell in the current folder
+    /// if there isn't one. Returns whether there's a shell to talk to.
+    fn focus_terminal(&mut self) -> bool {
+        if self.terminal.is_none() {
+            let (rows, cols) = self.terminal_size;
+            match TermPanel::spawn(&self.shell, &self.dir, rows, cols) {
+                Ok(t) => self.terminal = Some(t),
+                Err(e) => {
+                    self.error(format!("can't start a shell: {e}"));
+                    return false;
+                }
+            }
+        }
+        self.terminal_open = true;
+        if self.focus != Focus::Terminal {
+            self.focus_before_terminal = self.focus;
+            self.focus = Focus::Terminal;
+        }
+        true
+    }
+
+    /// `x`: run the `.sh` file under the cursor in the terminal panel, so its
+    /// output stays in the scrollback.
+    pub fn run_script(&mut self) {
+        let Some(e) = self.current() else { return };
+        let target_is_sh = e
+            .link_target
+            .as_ref()
+            .and_then(|t| t.file_name())
+            .is_some_and(|n| n.to_string_lossy().ends_with(".sh"));
+        if e.is_dir() || !(e.name.ends_with(".sh") || target_is_sh) {
+            return self.error("x runs .sh files".into());
+        }
+        let path = self.dir.join(&e.file_name);
+        if self.focus_terminal()
+            && let Some(t) = &mut self.terminal
+        {
+            let line = format!("bash {}\r", clipboard::shell_quote(&path.to_string_lossy()));
+            t.write(line.as_bytes());
+        }
+    }
+
+    /// Keeps the pty the size of the panel's body, (rows, cols).
+    pub fn sync_terminal_size(&mut self, size: Option<(u16, u16)>) {
+        let Some(size) = size else { return };
+        self.terminal_size = size;
+        if let Some(t) = &mut self.terminal {
+            t.resize(size.0, size.1);
         }
     }
 
@@ -275,6 +385,85 @@ impl App {
         }
     }
 
+    /// `p`: properties of the selection, or of the cursor item.
+    pub fn open_props(&mut self) {
+        let targets = self.targets();
+        if targets.is_empty() {
+            return;
+        }
+        let props = Props::new(&targets, self.home.as_deref(), &self.tz);
+        self.modal = Some(Modal::Props(Box::new(props)));
+    }
+
+    /// Asks for a fresh git status for the current folder.
+    fn refresh_git(&mut self) {
+        self.git_watch.request(&self.dir);
+        self.git_asked = Instant::now();
+    }
+
+    pub fn open_help(&mut self) {
+        self.modal = Some(Modal::Help(HelpState {
+            cursor: 0,
+            filter: TextInput::default(),
+            typing: false,
+        }));
+    }
+
+    /// `f`: find files under the current folder.
+    pub fn open_picker(&mut self) {
+        let picker = FilePicker::open(self.dir.clone(), self.show_hidden);
+        self.modal = Some(Modal::Picker(Box::new(picker)));
+        self.focus = Focus::Files;
+    }
+
+    /// `F`: search the contents of files under the current folder.
+    pub fn open_search(&mut self) {
+        let search = ContentSearch::open(self.dir.clone(), self.show_hidden);
+        self.modal = Some(Modal::Search(Box::new(search)));
+        self.focus = Focus::Files;
+    }
+
+    /// `Shift-Enter` in a picker or search: open the highlighted file in
+    /// Helix, at the matched line for a content search.
+    pub fn picker_edit(&mut self) {
+        let (path, line) = match &self.modal {
+            Some(Modal::Picker(p)) => (p.selected_path(), None),
+            Some(Modal::Search(s)) => match s.selected() {
+                Some((path, line)) => (Some(path), Some(line)),
+                None => (None, None),
+            },
+            _ => return,
+        };
+        let Some(path) = path else { return };
+        if let Err(what) = text_or_not(&path) {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            return self.error(format!("Shift-Enter edits text files; {name} is {what}"));
+        }
+        self.modal = None;
+        self.edit_files(vec![path], line);
+    }
+
+    /// `Enter` in a picker or search: go to the file's folder with the
+    /// cursor on it.
+    pub fn picker_jump(&mut self) {
+        let path = match &self.modal {
+            Some(Modal::Picker(p)) => p.selected_path(),
+            Some(Modal::Search(s)) => s.selected().map(|(path, _)| path),
+            _ => return,
+        };
+        let Some(path) = path else {
+            return;
+        };
+        self.modal = None;
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return;
+        };
+        if name.to_string_lossy().starts_with('.') {
+            self.show_hidden = true;
+        }
+        self.go(parent.to_path_buf(), Some(name.to_os_string()));
+    }
+
     pub fn start_filter(&mut self) {
         self.filtering = true;
     }
@@ -333,7 +522,10 @@ impl App {
     /// A plain rename of the cursor item, or a bulk rename of the selection.
     pub fn start_rename(&mut self) {
         let names: Vec<OsString> = if self.selection.is_empty() {
-            self.current().map(|e| e.file_name.clone()).into_iter().collect()
+            self.current()
+                .map(|e| e.file_name.clone())
+                .into_iter()
+                .collect()
         } else {
             self.selection.clone()
         };
@@ -347,6 +539,47 @@ impl App {
             _ => TextInput::default(),
         };
         self.modal = Some(Modal::Rename { olds, input });
+    }
+
+    /// `n` / `N`: ask for a name for a new file or folder here.
+    pub fn start_create(&mut self, folder: bool) {
+        self.modal = Some(Modal::Create {
+            folder,
+            input: TextInput::default(),
+        });
+    }
+
+    /// `Enter` in the create dialog. Never overwrites anything.
+    pub fn apply_create(&mut self) {
+        let Some(Modal::Create { folder, input }) = &self.modal else {
+            return;
+        };
+        let (folder, name) = (*folder, input.text.clone());
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return self.error("a name can't be empty, . or .., or contain /".into());
+        }
+        let path = self.dir.join(&name);
+        if self.vfs.exists(&path) {
+            return self.error(format!("“{name}” already exists here"));
+        }
+        let made = if folder {
+            self.vfs.create_dir(&path)
+        } else {
+            self.vfs.create_file(&path)
+        };
+        self.modal = None;
+        match made {
+            Ok(()) => {
+                if name.starts_with('.') {
+                    self.show_hidden = true;
+                }
+                self.info(format!("created {name}"));
+                self.selection.clear();
+                self.filter.clear();
+                self.reload(Some(OsString::from(&name)));
+            }
+            Err(e) => self.error(format!("can't create {name}: {e}")),
+        }
     }
 
     /// Every name in the folder, hidden ones included.
@@ -380,11 +613,14 @@ impl App {
                 Some(rename::Problem::Clash) => {
                     return self.error(format!("“{}” already exists here", row.new));
                 }
-                Some(_) => return self.error("a name can't be empty, . or .., or contain /".into()),
+                Some(_) => {
+                    return self.error("a name can't be empty, . or .., or contain /".into());
+                }
                 None => {}
             }
         } else if rows.iter().any(|r| r.problem.is_some()) {
-            return self.error("fix the names marked ✗ first: empty, clashing or containing /".into());
+            return self
+                .error("fix the names marked ✗ first: empty, clashing or containing /".into());
         }
         self.modal = None;
         let first = rows.first().map(|r| OsString::from(&r.new));
@@ -405,16 +641,78 @@ impl App {
         let focus = focus.or_else(|| self.current().map(|e| e.file_name.clone()));
         match self.vfs.list(&self.dir) {
             Ok(mut entries) => {
-                sort_entries(&mut entries);
+                sort_entries(&mut entries, self.sort);
                 self.entries = entries;
                 self.count_folders();
                 self.refilter(focus.as_deref(), anchor);
+                self.refresh_git();
             }
             Err(e) => {
                 let shown = self.display_path(&self.dir);
                 self.error(format!("can't reread {shown}: {e}"));
             }
         }
+    }
+
+    /// `e`: text files open in the running Helix (or a new one in a kitty
+    /// tab); a folder gets `hx .` in a new tab.
+    pub fn open_editor(&mut self) {
+        let targets = self.targets();
+        let Some(first) = targets.first() else { return };
+        if targets.len() == 1 && first.is_dir() {
+            let dir = first.clone();
+            let shown = self.display_path(&dir);
+            return self.job(move |k| {
+                k.edit_folder(&dir)
+                    .map(|()| format!("started Helix in {shown}, in a new tab"))
+            });
+        }
+        for path in &targets {
+            if let Err(what) = text_or_not(path) {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                return self.error(format!("e edits text files; {name} is {what}"));
+            }
+        }
+        self.edit_files(targets, None);
+    }
+
+    /// Opens text files in Helix, the first one at `line` if given.
+    fn edit_files(&mut self, targets: Vec<PathBuf>, line: Option<u64>) {
+        let mut what = match targets.as_slice() {
+            [one] => one
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            many => format!("{} files", many.len()),
+        };
+        if let Some(n) = line {
+            what.push_str(&format!(" at line {n}"));
+        }
+        let cwd = self.dir.clone();
+        self.job(move |k| {
+            k.open_files(&targets, line, &cwd)
+                .map(|opened| match opened {
+                    Opened::Existing => format!("opened {what} in Helix"),
+                    Opened::NewTab => format!("started Helix on {what}, in a new tab"),
+                })
+        });
+    }
+
+    /// Runs a kitty call on a thread; its outcome arrives as a message.
+    fn job(&mut self, f: impl FnOnce(&Kitty) -> Result<String, String> + Send + 'static) {
+        let kitty = match Kitty::from_env("helix") {
+            Ok(k) => k,
+            Err(e) => return self.error(e),
+        };
+        let tx = self.jobs.0.clone();
+        thread::spawn(move || {
+            let message = match f(&kitty) {
+                Ok(text) => Message { text, error: false },
+                Err(text) => Message { text, error: true },
+            };
+            let _ = tx.send(message);
+        });
     }
 
     /// Opens the cursor item with the default app; a folder is entered instead.
@@ -473,7 +771,7 @@ impl App {
                 Some(s) => s.path.clone(),
                 None => return,
             },
-            Focus::Files => match self.current() {
+            Focus::Files | Focus::Terminal => match self.current() {
                 Some(e) if e.is_dir() => self.dir.join(&e.file_name),
                 _ => self.dir.clone(),
             },
@@ -490,6 +788,31 @@ impl App {
             .min(self.shortcuts.items.len().saturating_sub(1));
     }
 
+    /// `s`: name → type → size → modified, each in its natural direction.
+    pub fn cycle_sort(&mut self) {
+        let by = self.sort.by.next();
+        self.set_sort(Sort { by, reverse: false });
+    }
+
+    /// `S`: flip the current order.
+    pub fn reverse_sort(&mut self) {
+        let sort = Sort {
+            reverse: !self.sort.reverse,
+            ..self.sort
+        };
+        self.set_sort(sort);
+    }
+
+    /// Re-sorts, keeping the cursor on its item.
+    fn set_sort(&mut self, sort: Sort) {
+        // Before sorting: `visible` still indexes the old order.
+        let name = self.current().map(|e| e.file_name.clone());
+        self.sort = sort;
+        sort_entries(&mut self.entries, sort);
+        self.refilter(name.as_deref(), 0);
+        self.info(format!("sorted by {}", sort.label()));
+    }
+
     pub fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
         self.refilter_here();
@@ -499,16 +822,23 @@ impl App {
         self.preview = !self.preview;
     }
 
-    /// Point the preview at the item under the cursor and ask the worker for
-    /// it. `size` is the preview body in cells, or `None` while it's hidden.
-    pub fn sync_preview(&mut self, size: Option<(u16, u16)>) {
-        self.preview_key = match (size, self.current()) {
-            (Some(size), Some(e)) => Some(preview::Key {
+    /// Point the preview at the item under the cursor, or at the picker's
+    /// highlighted file while a picker is open, and ask the worker for it.
+    /// The sizes are the preview bodies in cells, `None` while hidden.
+    pub fn sync_preview(&mut self, pane: Option<(u16, u16)>, picker: Option<(u16, u16)>) {
+        self.preview_key = match &self.modal {
+            Some(Modal::Picker(p)) => picker
+                .zip(p.selected_path())
+                .map(|(size, path)| file_key(path, size, None)),
+            Some(Modal::Search(s)) => picker
+                .zip(s.selected())
+                .map(|(size, (path, line))| file_key(path, size, Some(line))),
+            _ => pane.zip(self.current()).map(|(size, e)| preview::Key {
                 path: self.dir.join(&e.file_name),
                 mtime: e.mtime,
                 size,
+                line: None,
             }),
-            _ => None,
         };
         if let Some(key) = &self.preview_key {
             self.previewer.want(key);
@@ -518,6 +848,43 @@ impl App {
     /// Takes what the workers have finished; returns whether anything changed.
     pub fn drain_workers(&mut self) -> bool {
         let mut changed = self.previewer.drain();
+        while let Ok(m) = self.jobs.1.try_recv() {
+            self.push_message(m.text, m.error);
+            changed = true;
+        }
+        if let Some(t) = &mut self.terminal {
+            changed |= t.drain();
+            if t.exited() {
+                self.terminal = None;
+                self.terminal_open = false;
+                if self.focus == Focus::Terminal {
+                    self.focus = self.focus_before_terminal;
+                }
+                let key = self
+                    .keymap
+                    .first_key(Command::TermToggle)
+                    .map(|k| k.pretty())
+                    .unwrap_or_else(|| "term.toggle".into());
+                self.info(format!("the shell exited; {key} starts a new one"));
+                changed = true;
+            }
+        }
+        match &mut self.modal {
+            Some(Modal::Picker(p)) => changed |= p.tick(),
+            Some(Modal::Search(s)) => changed |= s.tick(),
+            Some(Modal::Props(p)) => changed |= p.drain(),
+            _ => {}
+        }
+        while let Ok((dir, status)) = self.git_watch.results.try_recv() {
+            if dir == self.dir {
+                changed |= self.git != status;
+                self.git = status;
+            }
+        }
+        // Commits and edits made elsewhere show up within a few seconds.
+        if self.git_asked.elapsed() >= GIT_REFRESH {
+            self.refresh_git();
+        }
         while let Ok(counted) = self.counter.results.try_recv() {
             changed |= self.apply_counts(counted);
         }
@@ -556,7 +923,7 @@ impl App {
 
     fn load(&mut self, dir: PathBuf, focus: Option<OsString>) -> io::Result<()> {
         let mut entries = self.vfs.list(&dir)?;
-        sort_entries(&mut entries);
+        sort_entries(&mut entries, self.sort);
         if let Some(e) = self.current() {
             self.remembered
                 .insert(self.dir.clone(), e.file_name.clone());
@@ -566,9 +933,15 @@ impl App {
         self.selection.clear();
         self.filter.clear();
         self.filtering = false;
+        // Within the same work tree the old status stays up while the
+        // new one comes, so the segment and marks don't blink.
+        if self.git.as_ref().is_some_and(|g| !dir.starts_with(&g.root)) {
+            self.git = None;
+        }
         self.dir = dir;
         self.entries = entries;
         self.count_folders();
+        self.refresh_git();
         self.refilter(focus.as_deref(), 0);
         Ok(())
     }
@@ -603,6 +976,38 @@ impl App {
             .and_then(|f| visible.iter().position(|&i| entries[i].file_name == f))
             .or_else(|| visible.iter().position(|&i| i >= anchor))
             .unwrap_or(visible.len().saturating_sub(1));
+    }
+}
+
+/// Ok for a text file; otherwise what it is, for the message.
+fn text_or_not(path: &Path) -> Result<(), &'static str> {
+    if path.is_dir() {
+        return Err("a folder");
+    }
+    let mut head = Vec::new();
+    let read = std::fs::File::open(path).and_then(|f| f.take(8 * 1024).read_to_end(&mut head));
+    if read.is_err() {
+        return Err("unreadable");
+    }
+    match classify(path, &head) {
+        FileKind::Text => Ok(()),
+        FileKind::Image => Err("an image"),
+        FileKind::Pdf => Err("a PDF"),
+        FileKind::Video => Err("a video"),
+        FileKind::Audio => Err("an audio file"),
+        FileKind::Archive => Err("an archive"),
+        FileKind::Binary => Err("a binary file"),
+    }
+}
+
+/// A preview key for a file that isn't in the listing.
+fn file_key(path: PathBuf, size: (u16, u16), line: Option<u64>) -> preview::Key {
+    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    preview::Key {
+        path,
+        mtime,
+        size,
+        line,
     }
 }
 
@@ -815,11 +1220,14 @@ mod tests {
     }
 
     fn names(app: &App) -> Vec<String> {
-        app.selection.iter().map(|s| s.entry.name.clone()).collect()
+        app.selection
+            .iter()
+            .map(|n| n.to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
-    fn selection_keeps_order_and_spans_folders() {
+    fn selection_keeps_order_and_stays_in_the_folder() {
         let tmp = tree();
         let r = root(&tmp);
         let mut app = App::new(r.clone(), None, None).unwrap();
@@ -830,32 +1238,40 @@ mod tests {
         select(&mut app, "a");
         app.toggle_select();
         assert!(app.is_selected(app.current().unwrap()));
-
-        select(&mut app, "b");
-        app.nav_enter();
-        select(&mut app, "y.txt");
+        select(&mut app, "link-y");
         app.toggle_select();
-        select(&mut app, "x.txt");
-        app.toggle_select();
-        assert_eq!(names(&app), ["file.txt", "a", "y.txt", "x.txt"]);
+        assert_eq!(names(&app), ["file.txt", "a", "link-y"]);
         assert_eq!(
             app.targets(),
-            [
-                r.join("file.txt"),
-                r.join("a"),
-                r.join("b/y.txt"),
-                r.join("b/x.txt")
-            ]
+            [r.join("file.txt"), r.join("a"), r.join("link-y")]
         );
 
         // Unselecting keeps the others in order.
-        select(&mut app, "y.txt");
+        select(&mut app, "a");
         app.toggle_select();
-        assert_eq!(names(&app), ["file.txt", "a", "x.txt"]);
+        assert_eq!(names(&app), ["file.txt", "link-y"]);
 
-        app.clear_selection();
+        // Leaving the folder drops the selection, and coming back doesn't
+        // bring it back.
+        select(&mut app, "b");
+        app.nav_enter();
         assert!(app.selection.is_empty());
-        assert_eq!(app.targets(), [r.join("b/y.txt")]);
+        app.nav_parent();
+        assert!(app.selection.is_empty());
+        assert_eq!(app.targets(), [r.join("b")]);
+    }
+
+    #[test]
+    fn hiding_dotfiles_unselects_them() {
+        let tmp = tree();
+        let mut app = App::new(root(&tmp), None, None).unwrap();
+        app.toggle_hidden();
+        select(&mut app, ".dot");
+        app.toggle_select();
+        select(&mut app, "a");
+        app.toggle_select();
+        app.toggle_hidden();
+        assert_eq!(names(&app), ["a"]);
     }
 
     #[test]
@@ -866,7 +1282,14 @@ mod tests {
         app.toggle_select();
         for _ in 0..500 {
             app.drain_workers();
-            if app.selection[0].entry.children.is_some() {
+            if app
+                .entries
+                .iter()
+                .find(|e| e.name == "b")
+                .unwrap()
+                .children
+                .is_some()
+            {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -920,5 +1343,71 @@ mod tests {
         assert_eq!(labels(&app), ["Home", "b"]);
         assert_eq!(app.side_cursor, 1);
         assert_eq!(app.shortcuts.items[1].path, r.join("b"));
+    }
+
+    /// Local, except trash moves into a folder of the test's own.
+    struct TestTrash(PathBuf);
+
+    impl Vfs for TestTrash {
+        fn list(&self, dir: &Path) -> io::Result<Vec<Entry>> {
+            Local.list(dir)
+        }
+        fn count_children(&self, dir: &Path) -> io::Result<usize> {
+            Local.count_children(dir)
+        }
+        fn resolve(&self, path: &Path) -> io::Result<PathBuf> {
+            Local.resolve(path)
+        }
+        fn exists(&self, path: &Path) -> bool {
+            Local.exists(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            Local.rename(from, to)
+        }
+        fn trash(&self, paths: &[PathBuf]) -> io::Result<()> {
+            for p in paths {
+                fs::rename(p, self.0.join(p.file_name().unwrap()))?;
+            }
+            Ok(())
+        }
+        fn create_file(&self, path: &Path) -> io::Result<()> {
+            Local.create_file(path)
+        }
+        fn create_dir(&self, path: &Path) -> io::Result<()> {
+            Local.create_dir(path)
+        }
+        fn delete(&self, path: &Path) -> io::Result<()> {
+            Local.delete(path)
+        }
+    }
+
+    #[test]
+    fn trash_moves_targets_and_keeps_the_cursor_close() {
+        let tmp = tree();
+        let r = root(&tmp);
+        let bin = TempDir::new().unwrap();
+        let mut app = App::new(r.clone(), None, None).unwrap();
+        app.vfs = Arc::new(TestTrash(bin.path().to_path_buf()));
+
+        select(&mut app, "file.txt");
+        app.start_remove(false);
+        app.confirm_remove();
+        assert_eq!(app.messages[0].text, "1 moved to trash, restorable");
+        assert!(bin.path().join("file.txt").exists());
+        // The cursor moves to the next item.
+        assert_eq!(name(&app), "link-y");
+
+        // Selection wins over the cursor.
+        select(&mut app, "a");
+        app.toggle_select();
+        select(&mut app, "link-z");
+        app.toggle_select();
+        app.start_remove(false);
+        app.confirm_remove();
+        assert!(bin.path().join("a").exists());
+        // A dangling link now, since its target is relative; it's still there.
+        assert!(fs::symlink_metadata(bin.path().join("link-z")).is_ok());
+        assert!(r.join("b/.z").exists(), "trashing a link keeps its target");
+        assert!(app.selection.is_empty());
     }
 }

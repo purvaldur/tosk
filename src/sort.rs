@@ -4,16 +4,80 @@ use std::str::Chars;
 
 use crate::entry::Entry;
 
-/// Folders first (symlinks to folders count), then natural, case-insensitive
-/// order ignoring a leading dot.
-pub fn sort_entries(entries: &mut [Entry]) {
-    entries.sort_by(compare);
+/// What the list is ordered by; `s` cycles through them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortBy {
+    #[default]
+    Name,
+    /// By extension, then name.
+    Type,
+    /// Largest first. Folders stay by name, since their counts arrive late.
+    Size,
+    /// Newest first.
+    Modified,
 }
 
-pub fn compare(a: &Entry, b: &Entry) -> Ordering {
-    b.is_dir()
-        .cmp(&a.is_dir())
-        .then_with(|| compare_names(&a.name, &b.name))
+impl SortBy {
+    pub fn next(self) -> SortBy {
+        match self {
+            SortBy::Name => SortBy::Type,
+            SortBy::Type => SortBy::Size,
+            SortBy::Size => SortBy::Modified,
+            SortBy::Modified => SortBy::Name,
+        }
+    }
+}
+
+/// What to sort by and whether `S` flipped it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sort {
+    pub by: SortBy,
+    pub reverse: bool,
+}
+
+impl Sort {
+    pub fn label(self) -> &'static str {
+        match (self.by, self.reverse) {
+            (SortBy::Name, false) => "name",
+            (SortBy::Name, true) => "name, Z to A",
+            (SortBy::Type, false) => "type",
+            (SortBy::Type, true) => "type, reversed",
+            (SortBy::Size, false) => "size, largest first",
+            (SortBy::Size, true) => "size, smallest first",
+            (SortBy::Modified, false) => "modified, newest first",
+            (SortBy::Modified, true) => "modified, oldest first",
+        }
+    }
+}
+
+/// Folders first (symlinks to folders count), then `sort.by`, with natural,
+/// case-insensitive names (ignoring a leading dot) breaking ties. Reversing
+/// flips everything but folders-first.
+pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
+    entries.sort_by(|a, b| compare(a, b, sort));
+}
+
+pub fn compare(a: &Entry, b: &Entry, sort: Sort) -> Ordering {
+    let dirs = a.is_dir() && b.is_dir();
+    let key = match sort.by {
+        SortBy::Name => Ordering::Equal,
+        SortBy::Type if dirs => Ordering::Equal,
+        SortBy::Type => extension(&a.name).cmp(&extension(&b.name)),
+        SortBy::Size if dirs => Ordering::Equal,
+        SortBy::Size => b.size.cmp(&a.size),
+        SortBy::Modified => b.mtime.cmp(&a.mtime),
+    };
+    let order = key.then_with(|| compare_names(&a.name, &b.name));
+    let order = if sort.reverse { order.reverse() } else { order };
+    b.is_dir().cmp(&a.is_dir()).then(order)
+}
+
+/// Lowercased, empty for none; a leading dot doesn't start one.
+fn extension(name: &str) -> String {
+    match strip_dot(name).rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => ext.to_lowercase(),
+        _ => String::new(),
+    }
 }
 
 pub fn compare_names(a: &str, b: &str) -> Ordering {
@@ -128,8 +192,84 @@ mod tests {
             Entry::new("broken".into(), Kind::Missing),
             Entry::new("src".into(), Kind::Dir),
         ];
-        sort_entries(&mut v);
+        sort_entries(&mut v, Sort::default());
         let names: Vec<&str> = v.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["src", "zz-link", "a.txt", "broken"]);
+    }
+
+    fn entry(name: &str, kind: Kind, size: u64, age_secs: u64) -> Entry {
+        let mut e = Entry::new(name.into(), kind);
+        e.size = size;
+        e.mtime =
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 - age_secs));
+        e
+    }
+
+    fn order(by: SortBy) -> Vec<String> {
+        order_in(Sort { by, reverse: false })
+    }
+
+    fn order_in(sort: Sort) -> Vec<String> {
+        let mut v = vec![
+            entry("b.txt", Kind::File, 10, 5),
+            entry("a.rs", Kind::File, 300, 50),
+            entry("zz", Kind::Dir, 0, 1),
+            entry("c.TXT", Kind::File, 20, 30),
+            entry("Makefile", Kind::File, 300, 10),
+            entry("aa", Kind::Dir, 0, 100),
+        ];
+        sort_entries(&mut v, sort);
+        v.into_iter().map(|e| e.name).collect()
+    }
+
+    #[test]
+    fn sort_modes() {
+        assert_eq!(
+            order(SortBy::Name),
+            ["aa", "zz", "a.rs", "b.txt", "c.TXT", "Makefile"]
+        );
+        // No extension sorts first; ties go by name.
+        assert_eq!(
+            order(SortBy::Type),
+            ["aa", "zz", "Makefile", "a.rs", "b.txt", "c.TXT"]
+        );
+        // Folders keep name order; equal sizes go by name.
+        assert_eq!(
+            order(SortBy::Size),
+            ["aa", "zz", "a.rs", "Makefile", "c.TXT", "b.txt"]
+        );
+        assert_eq!(
+            order(SortBy::Modified),
+            ["zz", "aa", "b.txt", "Makefile", "c.TXT", "a.rs"]
+        );
+    }
+
+    #[test]
+    fn reversed_keeps_folders_on_top() {
+        let rev = |by| order_in(Sort { by, reverse: true });
+        assert_eq!(
+            rev(SortBy::Size),
+            ["zz", "aa", "b.txt", "c.TXT", "Makefile", "a.rs"]
+        );
+        assert_eq!(
+            rev(SortBy::Modified),
+            ["aa", "zz", "a.rs", "c.TXT", "Makefile", "b.txt"]
+        );
+        assert_eq!(
+            rev(SortBy::Name),
+            ["zz", "aa", "Makefile", "c.TXT", "b.txt", "a.rs"]
+        );
+    }
+
+    #[test]
+    fn cycle() {
+        let mut by = SortBy::default();
+        for _ in 0..4 {
+            by = by.next();
+        }
+        assert_eq!(by, SortBy::Name);
+        let label = |by, reverse| Sort { by, reverse }.label();
+        assert_eq!(label(SortBy::Size, true), "size, smallest first");
+        assert_eq!(label(SortBy::Modified, true), "modified, oldest first");
     }
 }

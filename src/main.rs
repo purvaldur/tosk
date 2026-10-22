@@ -2,20 +2,29 @@ mod app;
 mod clipboard;
 mod command;
 mod counts;
+mod du;
 mod entry;
 mod format;
 mod fs;
+mod git;
+mod grep;
+mod help;
 mod icons;
 mod input;
 mod keymap;
+mod kitty;
 mod launch;
 mod modal;
+mod picker;
 mod preview;
+mod props;
 mod rename;
 mod shortcuts;
 mod sort;
+mod term_panel;
 mod text_input;
 mod theme;
+mod tool;
 mod ui;
 
 use std::io::{self, Stdout};
@@ -98,8 +107,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Resu
         dirty |= app.drain_workers();
         if dirty {
             let size = terminal.size()?;
-            let areas = ui::Areas::new(Rect::new(0, 0, size.width, size.height), app.preview);
-            app.sync_preview(areas.preview_size());
+            let full = Rect::new(0, 0, size.width, size.height);
+            let areas = ui::Areas::new(full, app);
+            app.sync_terminal_size(areas.terminal_size());
+            app.sync_preview(areas.preview_size(), ui::picker_preview_size(full));
             terminal.draw(|frame| ui::draw(frame, app))?;
             dirty = false;
         }

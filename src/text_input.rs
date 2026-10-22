@@ -87,7 +87,19 @@ mod tests {
         let mut t = TextInput::default();
         press(&mut t, &["a", "b", "é", "Space", "C"]);
         assert_eq!(t.text, "abé C");
-        press(&mut t, &["Backspace", "Backspace", "Left", "x", "Home", ">", "End", "!"]);
+        press(
+            &mut t,
+            &[
+                "Backspace",
+                "Backspace",
+                "Left",
+                "x",
+                "Home",
+                ">",
+                "End",
+                "!",
+            ],
+        );
         assert_eq!(t.text, ">abxé!");
         assert_eq!(t.before_cursor(), ">abxé!");
         press(&mut t, &["C-u"]);

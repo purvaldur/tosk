@@ -22,6 +22,12 @@ pub const PEACH: Color = Color::Rgb(0xfa, 0xb3, 0x87);
 pub const GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
 pub const RED: Color = Color::Rgb(0xf3, 0x8b, 0xa8);
 
+/// Popups: a crisp white border over the app's own background, and text
+/// that stays bright; the dim tone is for hints and footers.
+pub const POPUP_BORDER: Color = TEXT;
+pub const POPUP_BG: Color = BASE;
+pub const POPUP_DIM: Color = SUBTEXT0;
+
 /// Cursor row, focused header, mode chip.
 pub const ACCENT: Color = LAVENDER;
 /// Text on an accent background.

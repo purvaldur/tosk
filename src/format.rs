@@ -55,6 +55,93 @@ pub fn human_size(bytes: u64) -> String {
     format!("{value:.1} {}", units[i])
 }
 
+/// Size with the exact count: `4.1 MB (4,100,000 bytes)`, or just
+/// `840 bytes` under 1 kB.
+pub fn exact_size(bytes: u64) -> String {
+    if bytes < 1000 {
+        return human_size(bytes);
+    }
+    format!("{} ({} bytes)", human_size(bytes), thousands(bytes))
+}
+
+/// `4,100,000`.
+pub fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `Monday 19 October 2026, 14:03` in the local time zone.
+pub fn full_date(t: SystemTime, tz: &TimeZone) -> String {
+    match Timestamp::try_from(t) {
+        Ok(ts) => ts
+            .to_zoned(tz.clone())
+            .strftime("%A %-d %B %Y, %H:%M")
+            .to_string(),
+        Err(_) => String::new(),
+    }
+}
+
+/// `drwxr-xr-x` from a raw `st_mode`, setuid, setgid and sticky included.
+pub fn mode_string(mode: u32) -> String {
+    let kind = match mode & 0o170000 {
+        0o040000 => 'd',
+        0o120000 => 'l',
+        0o020000 => 'c',
+        0o060000 => 'b',
+        0o010000 => 'p',
+        0o140000 => 's',
+        _ => '-',
+    };
+    let mut s = String::from(kind);
+    // (read, write, execute bit, special bit, special char)
+    for (shift, special, mark) in [(6, 0o4000, 's'), (3, 0o2000, 's'), (0, 0o1000, 't')] {
+        let bits = (mode >> shift) & 7;
+        s.push(if bits & 4 != 0 { 'r' } else { '-' });
+        s.push(if bits & 2 != 0 { 'w' } else { '-' });
+        let x = bits & 1 != 0;
+        s.push(match (mode & special != 0, x) {
+            (true, true) => mark,
+            (true, false) => mark.to_ascii_uppercase(),
+            (false, true) => 'x',
+            (false, false) => '-',
+        });
+    }
+    s
+}
+
+/// The name for `id` in an `/etc/passwd` or `/etc/group` style file, where
+/// the id is the third field.
+pub fn name_for_id(table: &str, id: u32) -> Option<String> {
+    table.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        let found: u32 = fields.nth(1)?.parse().ok()?;
+        (found == id).then(|| name.to_string())
+    })
+}
+
+/// `user:group`, with numbers for ids that aren't in the local tables.
+pub fn owner(uid: u32, gid: u32) -> String {
+    let lookup = |file: &str, id: u32| {
+        std::fs::read_to_string(file)
+            .ok()
+            .and_then(|t| name_for_id(&t, id))
+            .unwrap_or_else(|| id.to_string())
+    };
+    format!(
+        "{}:{}",
+        lookup("/etc/passwd", uid),
+        lookup("/etc/group", gid)
+    )
+}
+
 /// The selection summary, in Nautilus's words. Folder sizes are left out;
 /// "containing" counts direct children and is dropped until every folder
 /// has been counted.
@@ -139,6 +226,38 @@ mod tests {
         assert_eq!(human_size(1200), "1.2 kB");
         assert_eq!(human_size(4_100_000), "4.1 MB");
         assert_eq!(human_size(2_500_000_000_000_000), "2500.0 TB");
+    }
+
+    #[test]
+    fn exact_sizes_and_dates() {
+        assert_eq!(exact_size(840), "840 bytes");
+        assert_eq!(exact_size(4_100_000), "4.1 MB (4,100,000 bytes)");
+        assert_eq!(exact_size(4_356), "4.4 kB (4,356 bytes)");
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_000), "1,000");
+        assert_eq!(thousands(1_234_567_890), "1,234,567,890");
+        // 2026-10-19 12:00 UTC
+        let t = UNIX_EPOCH + Duration::from_secs(1_792_411_200);
+        assert_eq!(
+            full_date(t, &TimeZone::UTC),
+            "Monday 19 October 2026, 12:00"
+        );
+    }
+
+    #[test]
+    fn modes_and_owners() {
+        assert_eq!(mode_string(0o100644), "-rw-r--r--");
+        assert_eq!(mode_string(0o040755), "drwxr-xr-x");
+        assert_eq!(mode_string(0o120777), "lrwxrwxrwx");
+        assert_eq!(mode_string(0o104755), "-rwsr-xr-x");
+        assert_eq!(mode_string(0o041777), "drwxrwxrwt");
+        assert_eq!(mode_string(0o102640), "-rw-r-S---");
+        let passwd = "root:x:0:0::/root:/bin/bash\nthor:x:1000:1000::/home/thor:/bin/zsh\n";
+        assert_eq!(name_for_id(passwd, 1000).as_deref(), Some("thor"));
+        assert_eq!(name_for_id(passwd, 0).as_deref(), Some("root"));
+        assert_eq!(name_for_id(passwd, 5), None);
+        assert_eq!(name_for_id("broken line\n", 0), None);
     }
 
     fn file(name: &str, size: u64) -> Entry {

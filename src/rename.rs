@@ -236,7 +236,10 @@ mod tests {
         assert_eq!(p("x[8-99]"), "x8 x9 x10");
         assert_eq!(p("{name}-[1].{ext}"), "a-1.mkv b-2.mkv c-3.mkv");
         // Not tokens: kept literally.
-        assert_eq!(p("[x]{nam}[1-a]"), "[x]{nam}[1-a] [x]{nam}[1-a] [x]{nam}[1-a]");
+        assert_eq!(
+            p("[x]{nam}[1-a]"),
+            "[x]{nam}[1-a] [x]{nam}[1-a] [x]{nam}[1-a]"
+        );
     }
 
     #[test]
@@ -264,15 +267,27 @@ mod tests {
         assert_eq!(problems("b[1]"), [None, None]);
         let row = plan_single("a", "taken", &existing);
         assert_eq!(row.problem, Some(Problem::Clash));
-        assert_eq!(plan_single("a", "b", &existing).problem, Some(Problem::Clash));
+        assert_eq!(
+            plan_single("a", "b", &existing).problem,
+            Some(Problem::Clash)
+        );
         assert_eq!(plan_single("a", "a", &existing).problem, None);
-        assert_eq!(plan_single("a", "..", &existing).problem, Some(Problem::Invalid));
+        assert_eq!(
+            plan_single("a", "..", &existing).problem,
+            Some(Problem::Invalid)
+        );
     }
 
     #[test]
     fn five_episodes_in_selection_order() {
         // Selected out of sort order, numbered in selection order.
-        let picked = ["Pilot.mkv", "ep2 final.mkv", "Third.mkv", "4.mkv", "last.mkv"];
+        let picked = [
+            "Pilot.mkv",
+            "ep2 final.mkv",
+            "Third.mkv",
+            "4.mkv",
+            "last.mkv",
+        ];
         let tmp = folder(&picked);
         let olds = strings(&picked);
         let rows = plan_bulk("show.s01.e[01].mkv", &olds, &olds);
@@ -294,7 +309,11 @@ mod tests {
         assert_eq!(apply(&Local, tmp.path(), &rows), Ok(3));
         assert_eq!(
             listing(tmp.path()),
-            [("a".into(), "c".into()), ("b".into(), "a".into()), ("c".into(), "b".into())]
+            [
+                ("a".into(), "c".into()),
+                ("b".into(), "a".into()),
+                ("c".into(), "b".into())
+            ]
         );
     }
 
@@ -304,7 +323,11 @@ mod tests {
         let olds = strings(&["a", "b"]);
         let existing = strings(&["a", "b", "other"]);
         let rows = plan_bulk("other", &olds, &existing);
-        assert!(apply(&Local, tmp.path(), &rows).unwrap_err().starts_with("fix the names"));
+        assert!(
+            apply(&Local, tmp.path(), &rows)
+                .unwrap_err()
+                .starts_with("fix the names")
+        );
         let rows = plan_bulk("{name}", &strings(&["a"]), &existing);
         assert_eq!(apply(&Local, tmp.path(), &rows), Ok(0));
         assert_eq!(listing(tmp.path()).len(), 3);
@@ -318,7 +341,10 @@ mod tests {
         // n2 shows up after planning.
         fs::write(tmp.path().join("n2"), "intruder").unwrap();
         let err = apply(&Local, tmp.path(), &rows).unwrap_err();
-        assert_eq!(err, "renamed 1 of 2, then failed on b: n2 appeared in the meantime");
+        assert_eq!(
+            err,
+            "renamed 1 of 2, then failed on b: n2 appeared in the meantime"
+        );
         assert_eq!(
             listing(tmp.path()),
             [

@@ -119,6 +119,29 @@ impl Key {
     }
 }
 
+impl Key {
+    /// For people rather than config files: `Ctrl-t`, `Shift-Tab`.
+    pub fn pretty(&self) -> String {
+        let mut s = String::new();
+        if self.ctrl {
+            s.push_str("Ctrl-");
+        }
+        if self.alt {
+            s.push_str("Alt-");
+        }
+        if self.shift {
+            s.push_str("Shift-");
+        }
+        let plain = Key {
+            ctrl: false,
+            alt: false,
+            shift: false,
+            ..*self
+        };
+        s + &plain.to_string()
+    }
+}
+
 impl fmt::Display for Key {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.ctrl {
@@ -158,20 +181,25 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("c", "file.copy"),
     ("C", "path.copy"),
     ("r", "file.rename"),
+    ("n", "file.new"),
+    ("N", "file.new_folder"),
     ("d", "file.trash"),
     ("D", "file.delete"),
     ("Space", "select.toggle"),
     ("Esc", "select.clear"),
     ("x", "script.run"),
-    ("f", "picker.root"),
-    ("F", "picker.here"),
+    ("f", "picker.files"),
+    ("F", "picker.grep"),
     ("C-f", "filter.start"),
-    ("C-t", "term.toggle"),
+    ("C-s", "term.toggle"),
     ("Tab", "focus.next"),
     ("S-Tab", "focus.prev"),
     ("p", "file.props"),
     ("b", "shortcut.pin"),
     ("P", "view.preview"),
+    ("L", "view.log"),
+    ("s", "view.sort"),
+    ("S", "view.sort_reverse"),
     ("h", "view.hidden"),
     ("?", "help.open"),
     ("q", "app.quit"),
@@ -191,6 +219,14 @@ impl Keymap {
             })
             .collect();
         Keymap { bindings }
+    }
+
+    /// The key shown for `cmd` in menus: its first binding.
+    pub fn first_key(&self, cmd: Command) -> Option<Key> {
+        self.bindings
+            .iter()
+            .find(|&&(_, c)| c == cmd)
+            .map(|&(k, _)| k)
     }
 
     pub fn lookup(&self, key: Key) -> Option<Command> {
@@ -269,6 +305,15 @@ mod tests {
     }
 
     #[test]
+    fn pretty_names() {
+        let p = |s: &str| Key::parse(s).unwrap().pretty();
+        assert_eq!(p("C-t"), "Ctrl-t");
+        assert_eq!(p("S-Tab"), "Shift-Tab");
+        assert_eq!(p("A-C-x"), "Ctrl-Alt-x");
+        assert_eq!(p("q"), "q");
+    }
+
+    #[test]
     fn display_round_trips() {
         for s in [
             "q", "C", "?", "Space", "C-t", "S-Tab", "A-x", "C-A-Home", "Esc",
@@ -325,7 +370,7 @@ mod tests {
         assert_eq!(look("C"), Some("path.copy"));
         assert_eq!(look("c"), Some("file.copy"));
         assert_eq!(look("S-Tab"), Some("focus.prev"));
-        assert_eq!(look("C-t"), Some("term.toggle"));
+        assert_eq!(look("C-s"), Some("term.toggle"));
         assert_eq!(look("h"), Some("view.hidden"));
         // No vim keys.
         assert_eq!(look("g"), None);

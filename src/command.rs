@@ -38,13 +38,15 @@ commands! {
     FileCopy => "file.copy", "Copy file to clipboard";
     PathCopy => "path.copy", "Copy path to clipboard";
     FileRename => "file.rename", "Rename (bulk when several are selected)";
+    FileNew => "file.new", "New file";
+    FileNewFolder => "file.new_folder", "New folder";
     FileTrash => "file.trash", "Move to trash";
     FileDelete => "file.delete", "Delete permanently";
     SelectToggle => "select.toggle", "Select / unselect";
     SelectClear => "select.clear", "Clear selection and filter";
     ScriptRun => "script.run", "Run script in terminal panel";
-    PickerRoot => "picker.root", "File picker from launch folder";
-    PickerHere => "picker.here", "File picker from this folder";
+    PickerFiles => "picker.files", "File picker";
+    PickerGrep => "picker.grep", "Search file contents";
     FilterStart => "filter.start", "Filter this folder";
     TermToggle => "term.toggle", "Terminal: open and focus, again to hide";
     FocusNext => "focus.next", "Next area";
@@ -53,6 +55,9 @@ commands! {
     ShortcutPin => "shortcut.pin", "Pin or unpin shortcut";
     ViewPreview => "view.preview", "Toggle preview";
     ViewHidden => "view.hidden", "Toggle hidden files";
+    ViewLog => "view.log", "Toggle log";
+    ViewSort => "view.sort", "Sort by name, type, size or modified";
+    ViewSortReverse => "view.sort_reverse", "Reverse the sort order";
     HelpOpen => "help.open", "Shortcuts for this context";
     AppQuit => "app.quit", "Quit";
 }
@@ -94,6 +99,9 @@ pub fn dispatch(app: &mut App, cmd: Command) {
         FocusPrev => app.cycle_focus(-1),
         ViewHidden => app.toggle_hidden(),
         ViewPreview => app.toggle_preview(),
+        ViewLog => app.show_log = !app.show_log,
+        ViewSort => app.cycle_sort(),
+        ViewSortReverse => app.reverse_sort(),
         SelectToggle => app.toggle_select(),
         SelectClear => app.clear_selection(),
         OpenDefault => app.open_default(),
@@ -103,12 +111,20 @@ pub fn dispatch(app: &mut App, cmd: Command) {
         FileTrash => app.start_remove(false),
         FileDelete => app.start_remove(true),
         FileRename => app.start_rename(),
+        FileNew => app.start_create(false),
+        FileNewFolder => app.start_create(true),
+        HelpOpen => app.open_help(),
+        OpenEditor => app.open_editor(),
+        TermToggle => app.toggle_terminal(),
+        ScriptRun => app.run_script(),
+        PickerFiles => app.open_picker(),
+        PickerGrep => app.open_search(),
+        FileProps => app.open_props(),
         FilterStart => {
             app.focus = Focus::Files;
             app.start_filter();
         }
         AppQuit => app.quit = true,
-        _ => app.info(format!("{} isn't built yet", cmd.title())),
     }
 }
 
@@ -139,6 +155,8 @@ mod tests {
                 "file.copy",
                 "path.copy",
                 "file.rename",
+                "file.new",
+                "file.new_folder",
                 "file.trash",
                 "file.delete",
                 "select.toggle",
